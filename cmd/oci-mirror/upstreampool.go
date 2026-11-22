@@ -106,7 +106,7 @@ func (p *upstreamPool) lease(repo name.Repository) (*upstreamRegistry, *upstream
 	entry := p.registries[registryURL]
 	if entry == nil {
 		if len(p.registries) == p.limits.registries && !p.evictRegistry() {
-			return nil, nil, nil, fmt.Errorf("upstream registry context capacity exhausted: %w", errBusy)
+			return nil, nil, nil, fmt.Errorf("upstream registry context capacity exhausted: %w", quotaLimit(errBusy, "upstream-registries"))
 		}
 		r := &upstreamRegistry{
 			url:     registryURL,
@@ -120,7 +120,7 @@ func (p *upstreamPool) lease(repo name.Repository) (*upstreamRegistry, *upstream
 	e := r.scopes[scope]
 	if e == nil {
 		if len(r.scopes) == p.limits.scopes && !r.evictScope() {
-			return nil, nil, nil, fmt.Errorf("upstream pull scope context capacity exhausted: %w", errBusy)
+			return nil, nil, nil, fmt.Errorf("upstream pull scope context capacity exhausted: %w", quotaLimit(errBusy, "upstream-scopes-per-registry"))
 		}
 		s := &upstreamScope{scope: scope}
 		s.client = &http.Client{
@@ -177,21 +177,28 @@ func (r *upstreamRegistry) evictScope() bool {
 	return false
 }
 
+const upstreamAuthRefreshStage = "upstream_auth_refresh"
+
 // startHandshake requires p.mu. The same flight serves all waiters for this scope.
 func (p *upstreamPool) startHandshake(reg name.Registry, r *upstreamRegistry, s *upstreamScope) *upstreamHandshake {
 	handshake := &upstreamHandshake{ready: make(chan struct{})}
 	s.flight = handshake
 	r.pending++
-	go p.handshake(reg, r, s, handshake)
+	stage := "upstream_auth_initial"
+	if s.auth != nil {
+		stage = upstreamAuthRefreshStage
+	}
+	go p.handshake(reg, r, s, handshake, stage)
 	return handshake
 }
 
-func (p *upstreamPool) handshake(reg name.Registry, r *upstreamRegistry, s *upstreamScope, handshake *upstreamHandshake) {
+func (p *upstreamPool) handshake(reg name.Registry, r *upstreamRegistry, s *upstreamScope, handshake *upstreamHandshake, stage string) {
 	// A canceled waiter must not cancel a shared handshake.
 	ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
 	base := upstreamRateTransport{base: p.base, limiter: r.limiter}
 	handshake.transport, handshake.err = registry.NewWithContext(ctx, reg, authn.Anonymous, base, []string{s.scope})
 	cancel()
+	handshake.err = diagnoseAt(stage, handshake.err)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -242,7 +249,7 @@ func (t upstreamResourceTransport) RoundTrip(req *http.Request) (*http.Response,
 	}
 	t.pool.mu.Unlock()
 	if err := t.pool.wait(req.Context(), handshake); err != nil {
-		return nil, err
+		return nil, diagnoseAt(upstreamAuthRefreshStage, err)
 	}
 	resp, _, err = sendUpstreamResource(req, handshake)
 	return resp, err
@@ -264,7 +271,10 @@ type upstreamRateTransport struct {
 
 func (t upstreamRateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err := t.limiter.Wait(req.Context()); err != nil {
-		return nil, err
+		if req.Context().Err() == nil {
+			return nil, diagnoseFailure("upstream_rate_wait", "rate_wait_rejected", err)
+		}
+		return nil, diagnoseAt("upstream_rate_wait", err)
 	}
 	resp, err := t.base.RoundTrip(req)
 	if err == nil && resp.StatusCode == http.StatusUnauthorized && len(resp.Header.Values("WWW-Authenticate")) != 0 {

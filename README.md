@@ -185,10 +185,11 @@ Mirror 为每个请求生成 `X-Request-ID`，在响应中返回并传给可信�
 | --- | --- |
 | `backend_response_failed` / `backend_transport_failed` | 后端返回 `5xx`，或 Mirror 未能完成后端 HTTP 请求。`source` 区分主请求和缺失确认；传输失败记录经过分类的 `reason`，不记录原始错误。 |
 | `backend_fallback_skipped` | 后端 `404` 被原样返回。`reason` 区分 Registry 策略、无法识别的缺失响应和补探测没有确认；有探测时查看 `probe_method`、`probe_status` 或 `error_reason`。 |
-| `blob_request_failed` / `blob_response_aborted` | Blob 响应未能完成。用 `request_id` 找到对应 `flight_id`；截断事件还记录 `stage`、`bytes_sent` 和 `bytes_expected`。`reason=producer_failed` 时到下载事件查根因。 |
-| `blob_download_failed` | 每个共享下载只记录一次失败根因。按 `flight_id` 查询 `stage`、`reason`、digest，以及已知的下载偏移和上游状态。一般限额拒绝、正常上游缺失和取消不作为默认告警。 |
+| `manifest_request_failed` | `stage` 区分匿名鉴权初始化、刷新、限速等待、资源请求、正文读取和 Manifest 校验。`response_status` 是客户端收到的状态，与实际 `upstream_status` 分开；例如上游返回 `200` 但 digest 不匹配时，客户端仍收到 `502`。 |
+| `blob_request_failed` / `blob_response_aborted` | Blob 响应未能完成。用 `request_id` 找到对应 `flight_id`；截断事件还记录 `stage`、`bytes_sent` 和 `bytes_expected`。`reason=producer_failed` 时到下载事件查根因。热 Blob 打开失败没有 `flight_id`，按 `request_id` 和 `stage` 区分目录查询、文件打开、校验和访问时间更新。 |
+| `blob_download_failed` | 每个共享下载只记录一次失败根因。按 `flight_id` 查询 `stage`、`reason`、digest，以及已知的下载偏移和上游状态。配额拒绝在这条下载事件或 `manifest_request_failed` 中以 INFO 记录，`limit` 对应具体 CLI 参数（不含 `-`）；普通上游缺失和客户端取消不做默认告警。 |
 
-这些诊断事件不包含认证头、Cookie、原始 URL/查询参数、签名 URL、验证器或响应体。普通后端 `401`/`403` 仍由后端处理，不逐条记错误。
+为了能直接定位，日志保留有效的仓库名、Tag/digest、Registry/上游主机，以及可用的实际与预期字节数、摘要、媒体类型或 SQLite 错误码。只去掉不必要的敏感内容：不写认证头、Cookie、原始 URL/查询参数、签名 URL、验证器或响应体。普通后端 `401`/`403` 仍由后端处理，不逐条记错误。
 
 ## 验收与清理
 

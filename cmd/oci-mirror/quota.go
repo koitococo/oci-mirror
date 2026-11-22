@@ -11,6 +11,18 @@ var (
 	errCacheFull = errors.New("cache quota exhausted")
 )
 
+type quotaLimitError struct {
+	dimension string
+	err       error
+}
+
+func (e *quotaLimitError) Error() string { return e.err.Error() }
+func (e *quotaLimitError) Unwrap() error { return e.err }
+
+func quotaLimit(err error, dimension string) error {
+	return &quotaLimitError{dimension: dimension, err: err}
+}
+
 type cacheLimits struct {
 	manifestBytes, blobBytes           int64
 	manifestEntries, blobEntries       int
@@ -60,8 +72,14 @@ func (q *fetchQuota) acquire(origin string) (*originUsage, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	u := q.origin[origin]
-	if q.closed || q.active >= q.limits.fetches || (u != nil && u.fetches >= q.limits.upstreamFetches) {
-		return nil, errBusy
+	if q.closed {
+		return nil, quotaLimit(errBusy, "cache_shutdown")
+	}
+	if q.active >= q.limits.fetches {
+		return nil, quotaLimit(errBusy, "cache-fetches")
+	}
+	if u != nil && u.fetches >= q.limits.upstreamFetches {
+		return nil, quotaLimit(errBusy, "cache-upstream-fetches")
 	}
 	if u == nil {
 		u = new(originUsage)
@@ -87,8 +105,11 @@ func (q *fetchQuota) release(origin string, u *originUsage) {
 func (q *fetchQuota) reserve(u *originUsage, size int64) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if size > q.limits.stagingBytes-q.staged || size > q.limits.upstreamStagingBytes-u.staging {
-		return errCacheFull
+	if size > q.limits.stagingBytes-q.staged {
+		return quotaLimit(errCacheFull, "cache-staging-bytes")
+	}
+	if size > q.limits.upstreamStagingBytes-u.staging {
+		return quotaLimit(errCacheFull, "cache-upstream-staging-bytes")
 	}
 	q.staged += size
 	u.staging += size

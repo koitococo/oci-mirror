@@ -96,20 +96,30 @@ func blobFailure(err error) *blobTransferFailure {
 	if errors.As(err, &failure) {
 		return failure
 	}
-	return &blobTransferFailure{stage: "download", reason: logErrorReason(err), offset: -1, err: err}
+	stage, reason := diagnosticDetails(err, "download")
+	return &blobTransferFailure{stage: stage, reason: reason, offset: -1, err: err}
 }
 
 func blobRequestFailed(ctx context.Context, key cacheKey, f *blobFlight, stage string, err error) {
+	status := http.StatusInternalServerError
+	if stage == "" {
+		status, _, _ = fetchFailureResponse("blobs", err)
+	}
 	level := slog.LevelWarn
-	if ctx.Err() != nil || fetchUpstreamStatus(err) == http.StatusNotFound || errors.Is(err, errBusy) || errors.Is(err, errCacheFull) {
+	if ctx.Err() != nil || status == http.StatusNotFound || errors.Is(err, errBusy) || errors.Is(err, errCacheFull) {
+		// Routine refusals are recorded once at the download boundary.
 		level = slog.LevelDebug
 	}
-	if stage != "" {
-		slog.Log(ctx, level, "blob_request_failed", "request_id", requestID(ctx), "flight_id", f.id, "digest", key.reference,
-			"stage", stage, "reason", logErrorReason(err))
-		return
+	attrs := []any{"request_id", requestID(ctx), "repository", key.downstream, "digest", key.reference, "response_status", status}
+	if f != nil {
+		attrs = append(attrs, "flight_id", f.id)
 	}
-	slog.Log(ctx, level, "blob_request_failed", "request_id", requestID(ctx), "flight_id", f.id, "digest", key.reference)
+	if stage != "" {
+		stage, reason := diagnosticDetails(err, stage)
+		attrs = append(attrs, "stage", stage, "reason", reason)
+		attrs = appendDiagnosticFields(attrs, err)
+	}
+	slog.Log(ctx, level, "blob_request_failed", attrs...)
 }
 
 func abortBlobResponse(ctx context.Context, key cacheKey, f *blobFlight, stage, reason string, sent, expected int64) {
@@ -155,7 +165,7 @@ func (c *mirrorCache) serveColdBlob(w http.ResponseWriter, r *http.Request, key 
 					return
 				}
 				blobRequestFailed(ctx, key, f, "", err)
-				writeFetchError(w, "blobs", err, false)
+				writeFetchError(w, "blobs", err)
 				return
 			}
 			if offset == 0 {
@@ -164,7 +174,8 @@ func (c *mirrorCache) serveColdBlob(w http.ResponseWriter, r *http.Request, key 
 			}
 			published, err := c.blobs.open(ctx, key)
 			if err != nil {
-				abortBlobResponse(ctx, key, f, "published_open", logErrorReason(err), offset, length)
+				stage, reason := diagnosticDetails(err, "published_open")
+				abortBlobResponse(ctx, key, f, stage, reason, offset, length)
 				return
 			}
 			defer published.Close()
@@ -202,7 +213,7 @@ func (c *mirrorCache) serveColdBlob(w http.ResponseWriter, r *http.Request, key 
 				return
 			}
 			blobRequestFailed(ctx, key, f, "staging_read", err)
-			writeFetchError(w, "blobs", cacheStorageError(err), false)
+			writeFetchError(w, "blobs", cacheStorageError(err))
 			return
 		}
 		first := offset == 0

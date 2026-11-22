@@ -17,14 +17,18 @@ type backendMissDecision struct {
 	probeStatus                      int
 }
 
-func (d backendMissDecision) logSkipped(resp *http.Response, kind string) {
+func (d backendMissDecision) logSkipped(resp *http.Response, read readRequest) {
 	ctx := resp.Request.Context()
 	attrs := []slog.Attr{
 		slog.String("request_id", requestID(ctx)),
 		slog.String("method", backendLogMethod(resp.Request.Method)),
-		slog.String("kind", kind),
+		slog.String("kind", read.kind),
 		slog.Int("backend_status", resp.StatusCode),
 		slog.String("reason", d.reason),
+	}
+	if read.repository.downstream != "" {
+		attrs = append(attrs, slog.String("repository", read.repository.downstream),
+			slog.String("reference", read.reference), slog.String("logical_registry", read.repository.logicalRegistry))
 	}
 	if d.probeMethod != "" {
 		attrs = append(attrs, slog.String("probe_method", d.probeMethod))

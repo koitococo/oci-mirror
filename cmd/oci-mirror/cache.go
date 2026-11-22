@@ -106,7 +106,7 @@ func (c *mirrorCache) serveManifest(w http.ResponseWriter, r *http.Request, repo
 	accept := r.Header.Values("Accept")
 	m, err := c.manifests.get(r.Context(), key)
 	if err != nil {
-		fetchError(w, "manifests", cacheStorageError(err))
+		manifestRequestFailed(w, r, repo, ref, diagnoseAt("manifest_lookup", cacheStorageError(err)))
 		return
 	}
 	if m == nil {
@@ -124,7 +124,7 @@ func (c *mirrorCache) serveManifest(w http.ResponseWriter, r *http.Request, repo
 		defer cancel()
 		m, err = c.fetchManifest(ctx, repo, key, allowed)
 		if err != nil {
-			fetchError(w, "manifests", err)
+			manifestRequestFailed(w, r, repo, ref, err)
 			return
 		}
 	}
@@ -144,35 +144,54 @@ func (c *mirrorCache) serveManifest(w http.ResponseWriter, r *http.Request, repo
 func (c *mirrorCache) fetchManifest(ctx context.Context, repo resolvedRepository, key cacheKey, allowed []string) (*manifest, error) {
 	usage, err := c.quota.acquire(repo.logicalRegistry)
 	if err != nil {
-		return nil, err
+		return nil, diagnoseAt("quota_acquire", err)
 	}
 	defer c.quota.release(repo.logicalRegistry, usage)
 	client, release, err := c.upstream.acquire(ctx, repo.source)
 	if err != nil {
-		return nil, err
+		return nil, diagnoseAt("upstream_acquire", err)
 	}
 	defer release()
 	ref := key.reference
 	resp, err := getUpstream(ctx, client, repo.source, "manifests", ref, strings.Join(allowed, ", "))
 	if err != nil {
-		return nil, err
+		return nil, diagnoseAt("upstream_get", err)
 	}
 	defer resp.Body.Close()
 	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if err != nil || !slices.Contains(manifestTypes, mediaType) {
-		return nil, errors.New("unsupported upstream manifest media type")
+	if err != nil {
+		return nil, manifestValidationFailure(resp, "invalid_content_type", err, "content_type_values", len(resp.Header.Values("Content-Type")))
+	}
+	if !slices.Contains(manifestTypes, mediaType) {
+		return nil, manifestValidationFailure(resp, "unsupported_media_type", errors.New("unsupported upstream manifest media type"), "media_type", boundedMediaType(mediaType))
 	}
 	if !slices.Contains(allowed, mediaType) {
-		return nil, &upstreamStatus{http.StatusNotAcceptable}
+		return nil, manifestValidationFailure(resp, "upstream_media_type_not_accepted", &upstreamStatus{http.StatusNotAcceptable}, "media_type", mediaType)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes+1))
-	if err != nil || len(body) > maxManifestBytes {
-		return nil, errors.New("upstream manifest read failed or exceeded size limit")
+	if err != nil {
+		fields := []any{"bytes_read", len(body)}
+		if resp.ContentLength >= 0 {
+			fields = append(fields, "bytes_expected", resp.ContentLength)
+		}
+		return nil, &diagnosticError{stage: "manifest_body_read", upstreamStatus: resp.StatusCode, err: err, fields: appendUpstreamHost(fields, resp.Request)}
+	}
+	if len(body) > maxManifestBytes {
+		return nil, manifestValidationFailure(resp, "manifest_too_large", errors.New("upstream manifest exceeded size limit"),
+			"bytes_read", len(body), "bytes_limit", maxManifestBytes)
 	}
 	digest := fmt.Sprintf("sha256:%x", sha256.Sum256(body))
 	declared := resp.Header.Get("Docker-Content-Digest")
 	if (digestPattern.MatchString(ref) && ref != digest) || (declared != "" && declared != digest) {
-		return nil, errors.New("upstream manifest digest mismatch")
+		fields := []any{"computed_digest", digest}
+		if declared != "" {
+			if digestPattern.MatchString(declared) {
+				fields = append(fields, "declared_digest", declared)
+			} else {
+				fields = append(fields, "invalid_declared_digest", true)
+			}
+		}
+		return nil, manifestValidationFailure(resp, "digest_mismatch", errors.New("upstream manifest digest mismatch"), fields...)
 	}
 	type descriptor struct {
 		Digest string
@@ -183,8 +202,15 @@ func (c *mirrorCache) fetchManifest(ctx context.Context, repo resolvedRepository
 		Config        descriptor
 		Layers        []descriptor
 	}
-	if err := json.Unmarshal(body, &metadata); err != nil || metadata.SchemaVersion != 2 {
-		return nil, errors.New("invalid upstream image manifest")
+	if err := json.Unmarshal(body, &metadata); err != nil {
+		var syntax *json.SyntaxError
+		if errors.As(err, &syntax) {
+			return nil, manifestValidationFailure(resp, "invalid_json", err, "json_offset", syntax.Offset)
+		}
+		return nil, manifestValidationFailure(resp, "invalid_json", err)
+	}
+	if metadata.SchemaVersion != 2 {
+		return nil, manifestValidationFailure(resp, "unsupported_schema_version", errors.New("unsupported upstream manifest schema version"), "schema_version", metadata.SchemaVersion)
 	}
 
 	refs := make([]blobDescriptor, 0, len(metadata.Layers)+1)
@@ -200,7 +226,7 @@ func (c *mirrorCache) fetchManifest(ctx context.Context, repo resolvedRepository
 	m := &manifest{mediaType: mediaType, digest: digest, body: body}
 	published, err := c.manifests.publish(ctx, key, m, refs)
 	if err != nil {
-		return nil, cacheStorageError(err)
+		return nil, diagnoseAt("manifest_publish", cacheStorageError(err))
 	}
 	if published == m {
 		log.Printf("mirror manifest published digest=%s", digest)
@@ -253,6 +279,7 @@ func (c *mirrorCache) serveBlob(w http.ResponseWriter, r *http.Request, repo res
 		return
 	}
 	if !errors.Is(err, os.ErrNotExist) {
+		blobRequestFailed(r.Context(), key, nil, "published_open", err)
 		registryError(w, http.StatusInternalServerError, "UNKNOWN", "cannot open verified blob")
 		return
 	}
@@ -264,7 +291,7 @@ func (c *mirrorCache) serveBlob(w http.ResponseWriter, r *http.Request, repo res
 	if err := flight.wait(r.Context()); err != nil {
 		if r.Context().Err() == nil {
 			blobRequestFailed(r.Context(), key, flight, "", err)
-			writeFetchError(w, "blobs", err, false)
+			writeFetchError(w, "blobs", err)
 		}
 		return
 	}
@@ -285,8 +312,10 @@ func (c *mirrorCache) joinBlobFlight(repo resolvedRepository, key cacheKey) *blo
 		expected, err := c.downloadBlob(repo, key, flight)
 		if err != nil {
 			failure := blobFailure(err)
-			attrs := []any{"flight_id", flight.id, "digest", key.reference, "logical_registry", repo.logicalRegistry,
+			attrs := []any{"flight_id", flight.id, "repository", key.downstream, "digest", key.reference,
+				"logical_registry", repo.logicalRegistry, "upstream_registry", repo.source.RegistryStr(),
 				"stage", failure.stage, "reason", failure.reason}
+			attrs = appendDiagnosticFields(attrs, err)
 			if expected >= 0 {
 				attrs = append(attrs, "bytes_expected", expected)
 			}
@@ -296,9 +325,21 @@ func (c *mirrorCache) joinBlobFlight(repo resolvedRepository, key cacheKey) *blo
 			if failure.upstreamStatus != 0 {
 				attrs = append(attrs, "upstream_status", failure.upstreamStatus)
 			}
+			if stage, reason := diagnosticDetails(err, ""); stage != "" && stage != failure.stage {
+				attrs = append(attrs, "error_stage", stage)
+				if reason != "io_error" && reason != failure.reason {
+					attrs = append(attrs, "error_reason", reason)
+				}
+			}
+			if limit := quotaDimension(err); limit != "" {
+				attrs = append(attrs, "limit", limit)
+			}
 			level := slog.LevelWarn
-			if fetchUpstreamStatus(err) == http.StatusNotFound || errors.Is(err, errBusy) || errors.Is(err, errCacheFull) || errors.Is(err, context.Canceled) {
+			switch {
+			case errors.Is(err, context.Canceled), fetchUpstreamStatus(err) == http.StatusNotFound:
 				level = slog.LevelDebug
+			case errors.Is(err, errBusy), errors.Is(err, errCacheFull):
+				level = slog.LevelInfo
 			}
 			slog.Log(c.ctx, level, "blob_download_failed", attrs...)
 		}
@@ -348,12 +389,12 @@ func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight
 		if errors.As(result, &failure) {
 			return
 		}
+		stage, classified := diagnosticDetails(result, stage)
+		if reason == "" {
+			reason = classified
+		}
 		if upstreamStatus := fetchUpstreamStatus(result); upstreamStatus != 0 {
 			status = upstreamStatus
-			reason = "upstream_status"
-		}
-		if reason == "" {
-			reason = logErrorReason(result)
 		}
 		result = &blobTransferFailure{stage: stage, reason: reason, offset: offset, upstreamStatus: status, err: result}
 	}()
@@ -399,8 +440,8 @@ func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight
 	}()
 	stage = "validate_length"
 	if known && resp.ContentLength >= 0 && expected != resp.ContentLength {
-		reason = "length_mismatch"
-		return expected, errors.New("upstream blob length does not match the Manifest")
+		return expected, diagnoseFailure(stage, "length_mismatch",
+			errors.New("upstream blob length does not match the Manifest"), appendUpstreamHost([]any{"bytes_actual", resp.ContentLength}, resp.Request)...)
 	}
 	if !known && resp.ContentLength >= 0 {
 		expected, known = resp.ContentLength, true
@@ -409,12 +450,11 @@ func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight
 		reason = "blob_too_large"
 		return expected, errors.New("upstream blob length above single-blob limit")
 	}
-	limits := c.quota.limits
-	limit := min(int64(maxBlobBytes), limits.blobBytes, limits.stagingBytes, limits.upstreamStagingBytes)
+	limit, limitDimension := blobDownloadLimit(c.quota.limits)
 	stage = "quota_reserve"
 	if known {
 		if expected > limit {
-			return expected, errCacheFull
+			return expected, quotaLimit(errCacheFull, limitDimension)
 		}
 		limit = expected
 	}
@@ -450,6 +490,9 @@ func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight
 	offset = n
 	if err != nil {
 		_ = file.Close()
+		if errors.Is(err, errCacheFull) {
+			err = quotaLimit(err, limitDimension)
+		}
 		return expected, err
 	}
 	stage = "staging_sync_close"
@@ -470,6 +513,23 @@ func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight
 	return expected, nil
 }
 
+func blobDownloadLimit(l cacheLimits) (int64, string) {
+	limit, dimension := int64(maxBlobBytes), "max_blob_bytes"
+	for _, candidate := range [...]struct {
+		bytes int64
+		name  string
+	}{
+		{l.blobBytes, "cache-blob-bytes"},
+		{l.stagingBytes, "cache-staging-bytes"},
+		{l.upstreamStagingBytes, "cache-upstream-staging-bytes"},
+	} {
+		if candidate.bytes < limit {
+			limit, dimension = candidate.bytes, candidate.name
+		}
+	}
+	return limit, dimension
+}
+
 type blobProgress struct{ flight *blobFlight }
 
 func (p blobProgress) Write(data []byte) (int, error) {
@@ -477,8 +537,45 @@ func (p blobProgress) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func fetchError(w http.ResponseWriter, kind string, err error) {
-	writeFetchError(w, kind, err, true)
+func boundedMediaType(mediaType string) string {
+	if len(mediaType) > 128 {
+		return mediaType[:128]
+	}
+	return mediaType
+}
+
+func manifestValidationFailure(resp *http.Response, reason string, err error, fields ...any) error {
+	return &diagnosticError{stage: "manifest_validate", reason: reason, upstreamStatus: resp.StatusCode, err: err, fields: appendUpstreamHost(fields, resp.Request)}
+}
+
+func manifestRequestFailed(w http.ResponseWriter, r *http.Request, repo resolvedRepository, ref string, err error) {
+	status, code, message := fetchFailureResponse("manifests", err)
+	stage, reason := diagnosticDetails(err, "manifest_fetch")
+	ctx := r.Context()
+	attrs := []any{"request_id", requestID(ctx), "repository", repo.downstream, "reference", ref,
+		"logical_registry", repo.logicalRegistry, "upstream_registry", repo.source.RegistryStr(),
+		"stage", stage, "reason", reason, "response_status", status}
+	attrs = appendDiagnosticFields(attrs, err)
+	if upstreamStatus := diagnosticUpstreamStatus(err); upstreamStatus != 0 {
+		attrs = append(attrs, "upstream_status", upstreamStatus)
+	}
+	if limit := quotaDimension(err); limit != "" {
+		attrs = append(attrs, "limit", limit)
+	}
+	level := slog.LevelWarn
+	switch {
+	case ctx.Err() != nil, status == http.StatusNotFound, status == http.StatusNotAcceptable:
+		level = slog.LevelDebug
+	case errors.Is(err, errBusy), errors.Is(err, errCacheFull):
+		level = slog.LevelInfo
+	}
+	slog.Log(ctx, level, "manifest_request_failed", attrs...)
+	registryError(w, status, code, message)
+}
+
+func writeFetchError(w http.ResponseWriter, kind string, err error) {
+	status, code, message := fetchFailureResponse(kind, err)
+	registryError(w, status, code, message)
 }
 
 func fetchUpstreamStatus(err error) int {
@@ -493,37 +590,27 @@ func fetchUpstreamStatus(err error) int {
 	return 0
 }
 
-func writeFetchError(w http.ResponseWriter, kind string, err error, diagnostics bool) {
-	status := fetchUpstreamStatus(err)
+func fetchFailureResponse(kind string, err error) (status int, code, message string) {
+	upstreamStatus := fetchUpstreamStatus(err)
 	switch {
 	case errors.Is(err, errBusy):
-		registryError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "global or upstream cold fetch limit reached")
+		return http.StatusServiceUnavailable, "UNAVAILABLE", "global or upstream cold fetch limit reached"
 	case errors.Is(err, errCacheFull):
-		registryError(w, http.StatusInsufficientStorage, "UNAVAILABLE", "Mirror cache quota exhausted")
+		return http.StatusInsufficientStorage, "UNAVAILABLE", "Mirror cache quota exhausted"
 	case errors.Is(err, errCacheStorage):
-		if diagnostics {
-			log.Printf("mirror cache failed kind=%s: %v", kind, err)
-		}
-		registryError(w, http.StatusInternalServerError, "UNKNOWN", "local Mirror cache failed")
+		return http.StatusInternalServerError, "UNKNOWN", "local Mirror cache failed"
 	case errors.Is(err, errPublicURL), errors.Is(err, errPublicIP), errors.Is(err, errPrivateDNS):
-		if diagnostics {
-			log.Printf("mirror egress policy rejected kind=%s", kind)
-		}
-		registryError(w, http.StatusBadGateway, "UNAVAILABLE", "upstream rejected by egress policy")
-	case status == http.StatusNotFound:
+		return http.StatusBadGateway, "UNAVAILABLE", "upstream rejected by egress policy"
+	case upstreamStatus == http.StatusNotFound:
 		code := "MANIFEST_UNKNOWN"
 		if kind == "blobs" {
 			code = "BLOB_UNKNOWN"
 		}
-		registryError(w, status, code, "content not found upstream")
-	case status == http.StatusNotAcceptable && kind == "manifests":
-		registryError(w, status, "MANIFEST_UNKNOWN", "upstream manifest media type not accepted")
+		return upstreamStatus, code, "content not found upstream"
+	case upstreamStatus == http.StatusNotAcceptable && kind == "manifests":
+		return upstreamStatus, "MANIFEST_UNKNOWN", "upstream manifest media type not accepted"
 	default:
-		// Upstream errors may contain signed URLs or token response bodies.
-		if diagnostics {
-			log.Printf("mirror fetch failed kind=%s upstream_status=%d error_type=%T", kind, status, err)
-		}
-		registryError(w, http.StatusBadGateway, "UNAVAILABLE", "upstream fetch or verification failed")
+		return http.StatusBadGateway, "UNAVAILABLE", "upstream fetch or verification failed"
 	}
 }
 

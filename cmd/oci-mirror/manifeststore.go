@@ -124,8 +124,11 @@ SELECT COALESCE(SUM(length(body)), 0), COUNT(*) + (SELECT COUNT(*) FROM manifest
 FROM manifests`).Scan(&usedBytes, &usedEntries); err != nil {
 		return nil, fmt.Errorf("read manifest cache usage: %w", err)
 	}
-	if (extraBytes > 0 && extraBytes > s.maxBytes-usedBytes) || extraEntries > s.maxEntries-usedEntries {
-		return nil, errCacheFull
+	if extraBytes > 0 && extraBytes > s.maxBytes-usedBytes {
+		return nil, quotaLimit(errCacheFull, "cache-manifest-bytes")
+	}
+	if extraEntries > s.maxEntries-usedEntries {
+		return nil, quotaLimit(errCacheFull, "cache-manifest-entries")
 	}
 
 	if existing == nil {

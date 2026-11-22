@@ -94,13 +94,13 @@ func (s *blobStore) open(ctx context.Context, key cacheKey) (*os.File, error) {
 		return nil, os.ErrNotExist
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read blob catalog: %w", err)
+		return nil, diagnoseFailure("catalog_lookup", "", fmt.Errorf("read blob catalog: %w", err))
 	}
 	path := s.path(key)
 	f, err := os.Open(path)
 	if err != nil {
 		// Do not wrap a file-not-found error: this is a corrupt hit, not a miss.
-		return nil, fmt.Errorf("open published blob %q: %v", path, err)
+		return nil, diagnoseFailure("published_file_open", logErrorReason(err), fmt.Errorf("open published blob %q: %v", path, err))
 	}
 	if err := checkBlobFile(path, size, f.Stat); err != nil {
 		f.Close()
@@ -111,7 +111,7 @@ func (s *blobStore) open(ctx context.Context, key cacheKey) (*os.File, error) {
 		if _, err := s.db.ExecContext(ctx, `UPDATE blobs SET accessed=? WHERE downstream=? AND source=? AND digest=?`,
 			now, key.downstream, key.source, key.reference); err != nil {
 			_ = f.Close()
-			return nil, fmt.Errorf("update blob recency: %w", err)
+			return nil, diagnoseFailure("catalog_recency_update", "", fmt.Errorf("update blob recency: %w", err))
 		}
 	}
 	return f, nil
@@ -120,10 +120,19 @@ func (s *blobStore) open(ctx context.Context, key cacheKey) (*os.File, error) {
 func checkBlobFile(path string, size int64, stat func() (os.FileInfo, error)) error {
 	info, err := stat()
 	if err != nil {
-		return fmt.Errorf("stat published blob %q: %v", path, err)
+		// Classify before preserving the non-wrapping corrupt-hit error.
+		return diagnoseFailure("published_file_stat", logErrorReason(err), fmt.Errorf("stat published blob %q: %v", path, err))
 	}
-	if !info.Mode().IsRegular() || info.Size() != size {
-		return fmt.Errorf("invalid published blob %q: mode %s, size %d, expected regular file of size %d", path, info.Mode(), info.Size(), size)
+	mode, actualSize := info.Mode(), info.Size()
+	regular := mode.IsRegular()
+	if !regular || actualSize != size {
+		reason := "size_mismatch"
+		if !regular {
+			reason = "invalid_file_type"
+		}
+		return diagnoseFailure("published_file_validate", reason,
+			fmt.Errorf("invalid published blob %q: mode %s, size %d, expected regular file of size %d", path, mode, actualSize, size),
+			"file_bytes_actual", actualSize, "file_bytes_expected", size)
 	}
 	return nil
 }
@@ -146,8 +155,11 @@ func (s *blobStore) publish(ctx context.Context, key cacheKey, stage string, siz
 	if size < 0 {
 		return fmt.Errorf("invalid staged blob size %d", size)
 	}
-	if size > s.maxBytes || s.maxEntries < 1 {
-		return errCacheFull
+	if size > s.maxBytes {
+		return quotaLimit(errCacheFull, "cache-blob-bytes")
+	}
+	if s.maxEntries < 1 {
+		return quotaLimit(errCacheFull, "cache-blob-entries")
 	}
 	if err := s.trimTo(ctx, s.maxBytes-size, s.maxEntries-1); err != nil {
 		return err
@@ -217,8 +229,11 @@ func (s *blobStore) trimTo(ctx context.Context, maxBytes int64, maxEntries int) 
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("close blob eviction candidates: %w", err)
 	}
-	if freeBytes > 0 || freeEntries > 0 {
-		return errCacheFull
+	if freeBytes > 0 {
+		return quotaLimit(errCacheFull, "cache-blob-bytes")
+	}
+	if freeEntries > 0 {
+		return quotaLimit(errCacheFull, "cache-blob-entries")
 	}
 	for _, v := range victims {
 		if err := s.evict(ctx, v.key, v.size); err != nil {

@@ -27,21 +27,22 @@ func upstreamRedirect(next *http.Request, via []*http.Request) error {
 }
 
 func getUpstream(ctx context.Context, client *http.Client, repo name.Repository, kind, ref, accept string) (*http.Response, error) {
+	const stage = "upstream_request"
 	u := url.URL{Scheme: "https", Host: repo.RegistryStr(), Path: "/v2/" + repo.RepositoryStr() + "/" + kind + "/" + ref}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, err
+		return nil, diagnoseFailure(stage, "request_construction_failed", err)
 	}
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, diagnoseAt(stage, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, &upstreamStatus{resp.StatusCode}
+		return nil, diagnoseFailure(stage, "upstream_http_status", &upstreamStatus{resp.StatusCode}, appendUpstreamHost(nil, resp.Request)...)
 	}
 	return resp, nil
 }

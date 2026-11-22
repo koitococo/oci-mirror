@@ -102,7 +102,7 @@ func overlay(backend *url.URL, policy fallbackPolicy, cache *mirrorCache, transp
 				decision = checkBackendMiss(resp, read, observed)
 			}
 			if decision.reason != "" {
-				decision.logSkipped(resp, read.kind)
+				decision.logSkipped(resp, read)
 				return nil
 			}
 			slog.DebugContext(resp.Request.Context(), "backend_fallback",
