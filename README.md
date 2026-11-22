@@ -49,7 +49,7 @@ zot_id=$(docker run --detach --rm --name "${scratch##*/}" \
 curl -fsS --max-time 2 --retry 15 --retry-all-errors --retry-delay 1 "$zot/v2/" >/dev/null
 
 "$scratch/oci-mirror" -listen 127.0.0.1:15000 -poc-zot "$zot" \
-  -poc-public-repo "$repo" -cache-dir "$scratch/cache" >"$scratch/mirror.log" 2>&1 &
+  -poc-enable-fallback -poc-public-repo "$repo" -cache-dir "$scratch/cache" >"$scratch/mirror.log" 2>&1 &
 mirror_pid=$!
 curl -fsS --max-time 2 --retry 15 --retry-all-errors --retry-delay 1 "$mirror/v2/" >/dev/null
 kill -0 "$mirror_pid"
@@ -58,6 +58,12 @@ kill -0 "$mirror_pid"
 该固定版本的 [Zot 发布配置](https://github.com/project-zot/zot/blob/v2.1.15/build/stacker.yaml) 默认执行 `serve /etc/zot/config.json`，镜像名见 [发布工作流](https://github.com/project-zot/zot/blob/v2.1.15/.github/workflows/publish.yaml)。上面的挂载让配置文件只读；`:Z` 仅重新标记临时副本，便于在启用 SELinux 的主机上使用。Zot 的 `/var/lib/registry` 留在容器可写层，不与 Mirror 缓存或现有数据卷共用。
 
 本机能访问 `r.ltkk.run` 时，也可把 `repo`、`tag` 改为 `r.ltkk.run/library/alpine`、`latest`，并在 Mirror 启动命令加 `-poc-private-dns-host r.ltkk.run`。该域名解析到私网，未列入 allowlist 时不会回源。此替代源是单平台镜像，不适用下文针对 `pause` 多架构清单的验收步骤。
+
+## 动态上游
+
+启用 `-poc-enable-fallback` 后，省略 `-poc-public-repo` 即可对任意符合出站策略的显式仓库回源，例如 `docker.io/library/alpine` 或 `registry.k8s.io/pause`。可重复配置 `-poc-allow-registry`、`-poc-deny-registry` 缩小范围，deny 优先。只想开放几个仓库时，重复 `-poc-public-repo`；`alpine`、`library/alpine` 等短名必须逐个用该选项批准。不开 `-poc-enable-fallback` 时仅转发 Zot。
+
+规范化只用于回源：Docker Hub 的 API 是 `registry-1.docker.io`，官方镜像补 `library/`；Zot 路径、JWT scope、覆盖 Tag 和缓存仍按客户端原仓库名隔离。上游须支持匿名 HTTPS/443，不能用路径指定端口、IP 或上游凭据。
 
 ## 验收与清理
 
