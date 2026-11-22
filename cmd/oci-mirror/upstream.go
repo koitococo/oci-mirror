@@ -22,10 +22,12 @@ type publicSource struct {
 	transport http.RoundTripper
 }
 
-func (s publicSource) get(ctx context.Context, kind, ref, accept string) (*http.Response, error) {
+// get opens the initial response and returns its scoped client so a Blob
+// download can resume without another authentication handshake.
+func (s publicSource) get(ctx context.Context, kind, ref, accept string) (*http.Response, *http.Client, error) {
 	transport, err := registry.NewWithContext(ctx, s.repo.Registry, authn.Anonymous, s.transport, []string{s.repo.Scope("pull")})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	client := http.Client{Transport: transport, CheckRedirect: func(next *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
@@ -40,20 +42,20 @@ func (s publicSource) get(ctx context.Context, kind, ref, accept string) (*http.
 	u := url.URL{Scheme: "https", Host: s.repo.RegistryStr(), Path: "/v2/" + s.repo.RepositoryStr() + "/" + kind + "/" + ref}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, &upstreamStatus{resp.StatusCode}
+		return nil, nil, &upstreamStatus{resp.StatusCode}
 	}
-	return resp, nil
+	return resp, &client, nil
 }
 
 type upstreamStatus struct{ status int }

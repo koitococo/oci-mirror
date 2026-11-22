@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -143,7 +142,7 @@ func (c *mirrorCache) fetchManifest(ctx context.Context, repo resolvedRepository
 	defer c.quota.release(repo.logicalRegistry, usage)
 	ref := key.reference
 	source := publicSource{repo: repo.source, transport: c.transport}
-	resp, err := source.get(ctx, "manifests", ref, strings.Join(allowed, ", "))
+	resp, _, err := source.get(ctx, "manifests", ref, strings.Join(allowed, ", "))
 	if err != nil {
 		return nil, err
 	}
@@ -324,11 +323,15 @@ func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight
 		return cacheStorageError(err)
 	}
 	source := publicSource{repo: repo.source, transport: c.transport}
-	resp, err := source.get(ctx, "blobs", key.reference, "")
+	resp, client, err := source.get(ctx, "blobs", key.reference, "")
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+	}()
 	if known && resp.ContentLength >= 0 && expected != resp.ContentLength {
 		return errors.New("upstream blob length does not match the Manifest")
 	}
@@ -374,7 +377,9 @@ func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight
 		flight.startStreaming(reader, expected)
 		progress = blobProgress{flight}
 	}
-	n, err := copyVerifiedBlob(file, resp.Body, key.reference, limit, known, progress)
+	initial := resp
+	resp = nil // The transfer owns the initial body, including on a resume.
+	n, err := copyVerifiedBlob(file, initial, client, key.reference, limit, known, progress)
 	if err != nil {
 		_ = file.Close()
 		return err
@@ -399,43 +404,6 @@ type blobProgress struct{ flight *blobFlight }
 func (p blobProgress) Write(data []byte) (int, error) {
 	p.flight.advance(len(data))
 	return len(data), nil
-}
-
-func copyVerifiedBlob(file *os.File, body io.Reader, digest string, limit int64, exact bool, progress io.Writer) (int64, error) {
-	h := sha256.New()
-	writers := [3]io.Writer{file, h, progress}
-	count := 2
-	if progress != nil {
-		count++
-	}
-	n, err := io.Copy(io.MultiWriter(writers[:count]...), io.LimitReader(body, limit))
-	if err != nil {
-		var pathError *os.PathError
-		if errors.As(err, &pathError) {
-			return 0, cacheStorageError(err)
-		}
-		return 0, err
-	}
-	if exact && n != limit {
-		return 0, errors.New("upstream blob shorter than expected")
-	}
-	// Check EOF without writing an extra byte past the staging reservation.
-	if n == limit {
-		var tail [1]byte
-		if _, err := io.ReadFull(body, tail[:]); err != io.EOF {
-			if err != nil {
-				return 0, err
-			}
-			if !exact && limit < maxBlobBytes {
-				return 0, errCacheFull
-			}
-			return 0, errors.New("upstream blob longer than allowed")
-		}
-	}
-	if "sha256:"+hex.EncodeToString(h.Sum(nil)) != digest {
-		return 0, errors.New("upstream blob digest mismatch")
-	}
-	return n, nil
 }
 
 func fetchError(w http.ResponseWriter, kind string, err error) {

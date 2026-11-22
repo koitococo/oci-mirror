@@ -82,6 +82,16 @@ Manifest 固定记录不淘汰；额度不足时新增绑定返回 `507`。Blob 
 
 保留的 JWT/TLS 环境已切到新版，仍使用同一个持久缓存目录。本机 Docker Engine 冷拉 `quay.io/libpod/alpine:latest`，本机 Skopeo 冷拉 `quay.io/libpod/busybox:latest` 并验证层摘要；Zot、docker-auth 和 Nginx 均保留。
 
+### 上游 Range 续传
+
+上游仍先收到一个不带 Range 的完整顺序 GET。只有响应体中断、已暂存至少一字节但尚未到总长、总长可信、内容编码为 identity（或未声明），且原响应有一个强 `ETag` 时，任务才会续传一次。Mirror 对原最终资源 URL（包括原查询参数）发送 `Range: bytes=<已暂存字节数>-` 和 `If-Range: <原 ETag>`；沿用同一个匿名上游客户端、暂存文件、摘要状态、配额和超时。续传不跟随新重定向，也不把客户端的 Range 或身份送往上游。
+
+只接受同一强 `ETag` 的单区间 `206`，`Content-Range` 必须覆盖准确偏移至原总长的全部剩余部分，并核对可用的 `Content-Length`、实际字节数和 EOF。返回 `200`、验证器或编码变化、区间错误时不读取响应体、不拼接；符合头部条件的 `206` 若再次中断或长度不符，也不会发布。失败时，已出流的客户端会收到中断，下次请求从零开始。上游无需提供分段 checksum，只有全量 OCI SHA-256 和正式发布成功才解锁尾字节。没有跨进程续传或并行分片。
+
+**实测：** 用真实 TLS 连接在写完前缀后主动断开，Mirror 从该字节偏移发送 `Range` / `If-Range`，保留原查询参数且未复制原请求的 Authorization 或 Cookie，续传后整块摘要一致。另用受控上游响应验证匹配 `206` 的尾字节在 EOF 和正式发布前扣留；`200`、错区间、弱或缺失验证器、重定向和实际体长错误均未发布，随后可重新从零下载。
+
+新版留存入口通过本机 Docker Engine 拉取 `registry.k8s.io/pause:3.9`，以及本机 Skopeo 拉取 `docker.io/library/alpine:3.22` 并核对镜像层摘要。这两项是实际 Registry 的正常拉取回归，断线续传由上面的受控场景验收。
+
 ## Smoke：按阶段执行
 
 先完成 [README 的本机启动](../README.md#本机启动)，在同一个 Bash 子 shell 中依次运行下列命令。每次从空 Zot 和空 Mirror 缓存开始。下述状态码、digest 和日志是**验收预期**，不是运行记录。只从上游读，唯一的 Push 和 Delete 目标是本次启动的本地 Mirror。
@@ -359,5 +369,5 @@ docker run --rm --network "$JWT_NETWORK" --add-host "$JWT_HOST:$JWT_IP" \
 
 1. **部署验证。** P0 的信任边界仅涵盖上面限定的专用 Zot 和传统 Registry Bearer JWT，不支持通用 OIDC、权限隐藏型后端、集群或远端同步。对外开放前按实际签发策略和目标版本复核错误 issuer/audience/scope、过期 token、权限隐藏和后端故障均不能触发回退；确认入站凭据不进入公网请求。
 2. **多上游调度。** 现有配额限制全局与每个逻辑 Registry 的并发及暂存；尚无更细的速率策略或有界、可复用的 Bearer 上下文。
-3. **续传。** 0002 §5.1 的完整冷 GET 已支持提前出流。上游中断仍结束当前任务，暂不支持 §5.2 的鉴别后 Range 续传，也不做分片或并行下载。
+3. **续传兼容性。** 本实现只续传一次完整剩余区间，暂不支持依赖续传重定向、分段返回或多次续传的上游。普通下载仍不分片、不并行。
 4. **上线验收。** 本文的验收只针对宿主机 Docker 与 Skopeo，不代表其它客户端或完整多架构矩阵。若客户端依赖 Blob HEAD `200` 才能 Pull，不能靠伪造成功响应通过验收。
