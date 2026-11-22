@@ -12,6 +12,28 @@
 
 Distribution 2.8.3 与 3.1.2 均已实测公网回退。Mirror 兼容 v2 的对象和 v3 的字符串缺失详情，但只在详情与请求资源精确匹配时回退。
 
+## 容器构建与 Compose 示例
+
+在 Linux Docker Engine 上，从仓库根目录执行：
+
+```bash
+docker buildx bake --load
+docker compose up -d --no-build
+curl -fsS --retry 10 --retry-all-errors http://127.0.0.1:15000/v2/
+```
+
+Bake 通过 [Dockerfile](Dockerfile) 构建镜像，默认标签为 `oci-mirror:local`。可在构建和启动前用 `OCI_MIRROR_IMAGE` 覆盖标签，也可以直接用 `docker compose up -d --build`。
+
+[Compose 示例](compose.yaml) 启动 Mirror 和 Distribution 3.1.2。Mirror 使用 Linux host 网络以满足回环监听要求，入口为 `127.0.0.1:15000`，后端只发布到 `127.0.0.1:15001`。两者各用独立的命名卷；`docker compose down` 保留数据。该示例使用无认证的本机 HTTP，不应直接开放到其他机器；需要对外提供服务时，使用 HTTPS 入口和有认证的后端。
+
+可用 Skopeo 验证真实回源（`--src-tls-verify=false` 仅用于这个回环 HTTP 示例）：
+
+```bash
+skopeo --override-os linux --override-arch amd64 copy --src-tls-verify=false \
+  docker://127.0.0.1:15000/registry.k8s.io/pause:3.10.1 \
+  "dir:$(mktemp -d)"
+```
+
 ## 本机启动
 
 下例在可信 Linux amd64 主机上新建临时环境。需要 rootful Docker（使用 host 网络）、Go 1.25+、`curl`、`jq`、`openssl`、`htpasswd` 和 Skopeo。预先为 `mirror-poc.test` 配置解析到 `127.0.0.1`，准备对此名称有效的 TLS 证书及私钥，并让宿主机 Docker daemon 信任其 CA（例如该 Registry 的 `/etc/docker/certs.d/mirror-poc.test:15443/ca.crt`）。设置 `POC_TLS_CERT`、`POC_TLS_KEY`、`POC_TLS_CA` 为对应文件的绝对路径；不要关闭 TLS 校验。TLS 证书与下面生成的 JWT 签名证书是两套不同材料。确认 `15443`、`15000`、`15001`、`15002` 空闲，并可匿名访问 `registry.k8s.io` 的 HTTPS 上游。在仓库根目录进入专用 `bash` 子 shell，执行：

@@ -1,0 +1,27 @@
+services:
+  registry:
+    image: registry:3.1.2
+    environment:
+      REGISTRY_HTTP_RELATIVEURLS: "true"
+    ports:
+      - "127.0.0.1:15001:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+
+  mirror:
+    image: ${OCI_MIRROR_IMAGE:-oci-mirror:local}
+    build: .
+    # Mirror only listens on loopback; Linux host networking exposes that loopback.
+    network_mode: host
+    depends_on:
+      - registry
+    command:
+      - -listen=127.0.0.1:15000
+      - -backend=http://127.0.0.1:15001
+      - -cache-dir=/var/lib/oci-mirror/cache
+    volumes:
+      - mirror-cache:/var/lib/oci-mirror/cache
+
+volumes:
+  registry-data:
+  mirror-cache:
