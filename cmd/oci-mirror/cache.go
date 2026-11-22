@@ -26,14 +26,12 @@ const (
 	maxBlobBytes     = 2 << 30
 )
 
-var (
-	manifestTypes = []string{
-		"application/vnd.oci.image.index.v1+json",
-		"application/vnd.oci.image.manifest.v1+json",
-		"application/vnd.docker.distribution.manifest.list.v2+json",
-		"application/vnd.docker.distribution.manifest.v2+json",
-	}
-)
+var manifestTypes = []string{
+	"application/vnd.oci.image.index.v1+json",
+	"application/vnd.oci.image.manifest.v1+json",
+	"application/vnd.docker.distribution.manifest.list.v2+json",
+	"application/vnd.docker.distribution.manifest.v2+json",
+}
 
 type mirrorCache struct {
 	*cacheStorage
@@ -319,9 +317,11 @@ func (c *mirrorCache) joinBlobFlight(repo resolvedRepository, key cacheKey) *blo
 		expected, err := c.downloadBlob(repo, key, flight)
 		if err != nil {
 			failure := blobFailure(err)
-			attrs := []any{"flight_id", flight.id, "repository", key.downstream, "digest", key.reference,
+			attrs := []any{
+				"flight_id", flight.id, "repository", key.downstream, "digest", key.reference,
 				"logical_registry", repo.logicalRegistry, "upstream_registry", repo.source.RegistryStr(),
-				"stage", failure.stage, "reason", failure.reason}
+				"stage", failure.stage, "reason", failure.reason,
+			}
 			attrs = appendDiagnosticFields(attrs, err)
 			if expected >= 0 {
 				attrs = append(attrs, "bytes_expected", expected)
@@ -559,9 +559,11 @@ func manifestRequestFailed(w http.ResponseWriter, r *http.Request, repo resolved
 	status, code, message := fetchFailureResponse("manifests", err)
 	stage, reason := diagnosticDetails(err, "manifest_fetch")
 	ctx := r.Context()
-	attrs := []any{"request_id", requestID(ctx), "repository", repo.downstream, "reference", ref,
+	attrs := []any{
+		"request_id", requestID(ctx), "repository", repo.downstream, "reference", ref,
 		"logical_registry", repo.logicalRegistry, "upstream_registry", repo.source.RegistryStr(),
-		"stage", stage, "reason", reason, "response_status", status}
+		"stage", stage, "reason", reason, "response_status", status,
+	}
 	attrs = appendDiagnosticFields(attrs, err)
 	if upstreamStatus := diagnosticUpstreamStatus(err); upstreamStatus != 0 {
 		attrs = append(attrs, "upstream_status", upstreamStatus)
