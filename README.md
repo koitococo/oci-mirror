@@ -1,12 +1,12 @@
 # OCI Registry Mirror
 
-这是一个部署在可信内网的通用 Registry Mirror；认证和授权由后端负责，不额外叠加偏离这一定位的限制。
+这是一个部署在可信内网的通用 Registry Mirror。客户端到 Mirror 的下游认证和仓库授权由后端负责；Mirror 到上游 Registry 的回源认证默认匿名，可单独配置拉取凭据。
 
 ## 后端与信任边界
 
 同一个引用（例如 `mirror-poc.test:15443/registry.k8s.io/pause:3.10`）可以先从公网 Pull，再由正常 Push 写入 Zot 并覆盖该 Tag。删除 Zot 的覆盖后，入口重新返回 Mirror 固定的公网版本。Mirror 缓存不写入 Zot，也不会让 Push 误以为 Zot 已有某个 Blob。
 
-`-backend` 指定受操作者信任的私有 HTTP/HTTPS Registry origin（可使用 IP 或 DNS 名称；在可信容器网络以外应使用 HTTPS），`-cache-dir` 必填。`-listen` 接受 IP 字面量和端口，默认 `127.0.0.1:15000`；在独立的 Docker 网络中可显式绑定 `0.0.0.0:15000`，由 ingress 访问而不发布宿主机端口。后端可使用符合下述契约的 Zot 或 Distribution。客户端连接受信任的 HTTPS 入口；Mirror 原样转发正常的 `/v2/` 探测与具体资源请求的 `Authorization`，并透传后端认证挑战。Mirror 不配置认证、不读取 JWT 证书或 issuer，也不会把 `/v2/` 成功当作具体仓库的拉取授权。
+`-backend` 指定受操作者信任的私有 HTTP/HTTPS Registry origin（可使用 IP 或 DNS 名称；在可信容器网络以外应使用 HTTPS），`-cache-dir` 必填。`-listen` 接受 IP 字面量和端口，默认 `127.0.0.1:15000`；在独立的 Docker 网络中可显式绑定 `0.0.0.0:15000`，由 ingress 访问而不发布宿主机端口。后端可使用符合下述契约的 Zot 或 Distribution。客户端连接受信任的 HTTPS 入口；Mirror 原样转发正常的 `/v2/` 探测与具体资源请求的 `Authorization`，并透传后端认证挑战。Mirror 不验证下游凭据、不读取后端 JWT 证书或 issuer，也不会把 `/v2/` 成功当作具体仓库的拉取授权。客户端的 `Authorization` 不会转发给上游。
 
 后端是本地存储和写入的权威：须先执行具体资源的鉴权再查找，不得把拒绝或故障伪装成类型化缺失。使用本地优先语义时，不能启用后端自身的代理缓存（如 Distribution proxy 或 Zot Sync）。Mirror 不用缓存代替后端上传检查，也不重写 `Location`；Distribution 应配置 `http.relativeurls: true` 或将 `http.host` 指向客户端可达的公开入口。
 
@@ -167,9 +167,36 @@ kill -0 "$mirror_pid"
 
 具体资源得到可信本地缺失后，回退始终启用。`-allow-registry`、`-deny-registry` 都可重复，按规范化后的逻辑 Registry 匹配：deny 优先；allow 为空时不额外限制 Registry（包括 Docker Hub），非空时只允许列出的 Registry。上游连接仍必须通过出站策略。
 
-规范化只用于确定回源位置：`alpine`、`library/alpine` 自动回退到 Docker Hub，API 是 `registry-1.docker.io`，官方镜像补 `library/`。后端路径、鉴权 scope 和覆盖 Tag 保持客户端原仓库名，缓存同时按原仓库名和规范化来源隔离。短名的回源映射不授予后端读取权限。上游须支持匿名 HTTPS/443，不能用路径指定端口、IP 或上游凭据。
+规范化只用于确定回源位置：`alpine`、`library/alpine` 自动回退到 Docker Hub，API 是 `registry-1.docker.io`，官方镜像补 `library/`。后端路径、鉴权 scope 和覆盖 Tag 保持客户端原仓库名，缓存同时按原仓库名和规范化来源隔离。短名的回源映射不授予后端读取权限。上游须使用 HTTPS/443，不能用路径指定端口、IP 或上游凭据。
 
-匿名上游的连接池和同仓库 pull token 可复用；速率与鉴权上下文数有界，见[出站参数](docs/poc.md#匿名上游与出站策略)。
+上游连接池和同仓库 pull token 可复用；速率与鉴权上下文数有界，见[出站参数](docs/poc.md#上游认证与出站策略)。
+
+### 可选上游认证
+
+用仅有拉取权限的账号，在部署主机上通过 [Skopeo](https://github.com/podman-container-tools/skopeo/blob/main/docs/skopeo-login.1.md) 生成独立的凭据文件；下例会交互式询问用户名和密码，Docker Hub 可用访问令牌作密码：
+
+```bash
+umask 077
+export UPSTREAM_AUTHFILE="$(mktemp -d)/auth.json"
+skopeo login --authfile "$UPSTREAM_AUTHFILE" docker.io
+```
+
+将以下两项分别追加到现有 `services.mirror.command` 和 `services.mirror.volumes`（保留原条目）：
+
+```yaml
+services:
+  mirror:
+    command:
+      - -upstream-authfile=/run/secrets/upstream-auth.json
+    volumes:
+      - ${UPSTREAM_AUTHFILE}:/run/secrets/upstream-auth.json:ro
+```
+
+保持文件权限最小化，确保容器运行用户（默认 UID/GID `65532:65532`，按宿主机的用户映射换算）可读；不要把文件提交到仓库。Mirror 仅在启动时读取显式指定的文件，凭据轮换后需重启。也可使用 [Docker CLI 登录](https://docs.docker.com/reference/cli/docker/login/) 生成的 `config.json`，但凭据须内嵌在 `auths` 中（Base64 不是加密）；如果凭据由 Docker Desktop、`credsStore` 或 `credHelpers` 保存，请用上面的 Skopeo 命令生成独立文件。Mirror 不执行 helper、不搜索默认配置、不执行登录。凭据匹配支持 Docker Hub 别名；更具体的仓库路径优先于上级路径或 Registry 条目。
+
+认证握手默认只信任 Registry 自身（Docker Hub 也信任 `auth.docker.io`）。确需独立令牌服务时，可用 `-upstream-auth-realm=registry.example.com=auth.example.com` 为该 Registry 增加一个精确主机名；仍适用 HTTPS/443、出站策略和 `-deny-registry`。凭据文件或条目不可用、上游拒绝凭据（按需先刷新 token），或握手目的地不受信任时，Mirror 告警并尝试匿名回源。匿名成功则正常返回，并按池内 pull scope 复用该选择，直至淘汰或重启；匿名失败仍按原有状态处理。
+
+上游账号由 Mirror 共享，不是客户端身份。仅在后端对原仓库名执行读取 ACL 并返回可信缺失后，才会查 Mirror 缓存或回源。已缓存的私有内容仍受该 ACL 控制；移除凭据文件不撤销客户端权限，也不会清除持久缓存。开放匿名读取的后端不应配置可读私有内容的上游账号。
 
 ## 持久缓存
 

@@ -137,6 +137,20 @@ func run() error {
 	cacheDir := flag.String("cache-dir", "", "directory for the persistent Mirror cache (required)")
 	limits := cacheLimitFlags()
 	upstreamLimit := upstreamLimitFlags()
+	authfile := flag.String("upstream-authfile", "", "read-only Docker/Skopeo auth file for upstream pulls (optional)")
+	authRealms := make(map[string]string)
+	flag.Func("upstream-auth-realm", "trust an additional token host for a registry (registry=hostname; repeatable for different registries)", func(value string) error {
+		reg, host, ok := strings.Cut(strings.ToLower(value), "=")
+		if !ok || !registryDNS(reg) || !registryDNS(host) {
+			return errors.New("expected registry=hostname using DNS names without ports")
+		}
+		reg = logicalRegistry(reg)
+		if _, exists := authRealms[reg]; exists {
+			return errors.New("only one additional token host per registry is supported")
+		}
+		authRealms[reg] = host
+		return nil
+	})
 	policy := fallbackPolicy{
 		allowed: make(map[string]struct{}),
 		denied:  make(map[string]struct{}),
@@ -177,7 +191,8 @@ func run() error {
 	defer stop()
 	transport := newBackendTransport()
 	defer transport.CloseIdleConnections()
-	cache, err := newMirrorCache(ctx, *cacheDir, newPublicTransport(privateDNSHosts), *limits, *upstreamLimit)
+	auth := upstreamAuth{file: loadUpstreamAuthFile(*authfile), realms: authRealms}
+	cache, err := newMirrorCache(ctx, *cacheDir, newPublicTransport(privateDNSHosts), *limits, *upstreamLimit, auth)
 	if err != nil {
 		return fmt.Errorf("open cache: %w", err)
 	}

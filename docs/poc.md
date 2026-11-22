@@ -4,7 +4,7 @@
 
 ```text
 客户端 → HTTPS 入口 → Mirror → 私有 Registry 后端（Zot 或 Distribution）
-           └── 可选签发端   └── 可信本地缺失 → Mirror 缓存或匿名 HTTPS 上游
+           └── 可选签发端   └── 可信本地缺失 → Mirror 缓存或 HTTPS 上游
 ```
 
 ### 下游认证与可信本地缺失
@@ -17,11 +17,11 @@ Zot 的 HTTP Basic 可由 `http.auth.htpasswd.path` 与可选的 `http.accessCon
 
 回退只信任与原请求相符的 Registry JSON `404`（`NAME_UNKNOWN`、`MANIFEST_UNKNOWN` 或 `BLOB_UNKNOWN`）；裸 `404`、不匹配的错误、鉴权挑战与后端故障均不触发回退。GET 先原样发给后端；Manifest GET 的 `NAME_UNKNOWN` 用同资源 HEAD 的 `404` 佐证，因为 Zot v2.1.15 的坏仓库布局在 GET 上也会返回此错误，但 HEAD 返回 `500`。初始 Manifest HEAD 的 `404` 没有响应体，用同资源 GET 验证类型化 `404`。探测不一致则保留首次响应；探测不是原子快照，不能与并发 Push 串行化。Blob HEAD 从不回退。
 
-### 匿名上游与出站策略
+### 上游认证与出站策略
 
-确认可信本地缺失后始终可按策略回退，短名自动归一到 Docker Hub。`-deny-registry` 优先于 `-allow-registry`；allow 为空时允许所有未被 deny 的逻辑 Registry（包括 Docker Hub），非空时仅允许列出的 Registry。回源只用匿名 HTTPS/443，以系统 CA 校验证书，并校验实际拨号地址。默认拒绝解析到非公网地址的主机。仅在受控私有部署且使用受管理 DNS 时，操作者才应按确切 FQDN 显式配置 `-private-dns-host`（例如 `r.ltkk.run`）。可重复配置；不匹配父域或通配符，Registry、Bearer realm 和重定向目标分别检查。此例外只允许相应 DNS 返回的 RFC 1918 / IPv6 ULA 地址，不允许直接使用私网 IP 字面量，也不放行回环、链路本地或元数据目的地。是否加入名单是独立于公开 DNS 或证书签发的管理决策；有效证书不能代替出站授权。
+确认可信本地缺失后始终可按策略回退，短名自动归一到 Docker Hub。`-deny-registry` 优先于 `-allow-registry`；allow 为空时允许所有未被 deny 的逻辑 Registry（包括 Docker Hub），非空时仅允许列出的 Registry。回源默认匿名，可用[显式认证文件](../README.md#可选上游认证)配置拉取凭据。无论是否使用凭据，回源只用 HTTPS/443，以系统 CA 校验证书，并校验实际拨号地址。默认拒绝解析到非公网地址的主机。仅在受控私有部署且使用受管理 DNS 时，操作者才应按确切 FQDN 显式配置 `-private-dns-host`（例如 `r.ltkk.run`）。可重复配置；不匹配父域或通配符，Registry、Bearer realm 和重定向目标分别检查。此例外只允许相应 DNS 返回的 RFC 1918 / IPv6 ULA 地址，不允许直接使用私网 IP 字面量，也不放行回环、链路本地或元数据目的地。是否加入名单是独立于公开 DNS 或证书签发的管理决策；有效证书不能代替出站授权。
 
-匿名 Registry 请求复用同一 HTTP Transport 和连接池。鉴权上下文以 Registry API 主机与规范化仓库的 `pull` scope 为键，不跨仓库共享 token；下游身份、缓存归属和后端路由继续使用原始仓库名。一个上游 Registry 的令牌桶计量注册表探测、令牌请求及重定向后的 CDN 请求；缓存命中不消耗出站额度。
+上游 Registry 请求复用同一 HTTP Transport 和连接池。鉴权上下文以 Registry API 主机与规范化仓库的 `pull` scope 为键，不跨仓库共享 token；下游身份、缓存归属和后端路由继续使用原始仓库名。一个上游 Registry 的令牌桶计量注册表探测、令牌请求及重定向后的 CDN 请求；缓存命中不消耗出站额度。
 
 | 参数 | 默认 | 含义 |
 | --- | --- | --- |
@@ -34,7 +34,7 @@ Zot 的 HTTP Basic 可由 `http.auth.htpasswd.path` 与可选的 `http.accessCon
 | --- | --- |
 | [0002](../.omp/specs/0002-mirror-zot-overlay.md) §2：本地优先 | Manifest `GET`/`HEAD` 与 Blob `GET`（含 `Range`）先用原方法访问后端；只有符合策略的可信本地缺失才回退。缓存不能跳过后端。Blob `HEAD`、上传、会话、mount、PUT、DELETE 和发现接口仍走后端。 |
 | 0002 §3：同名覆盖 | 新 Push 提交后，下一次 Tag 读取优先返回后端版本；按公网旧 digest 读取不转成 Tag 查找。删除本地 Tag 后可再次露出 Mirror 固定版本，不建立屏蔽记录。 |
-| 0002 §1、§4、[0001](../.omp/specs/0001-lazy-mirror.md) §3、§6：回源 | 用 [Distribution reference](https://pkg.go.dev/github.com/distribution/reference#ParseNormalizedNamed) 规范化上游。Docker Hub 短名自动映射，官方镜像补 `library/`，并访问 `registry-1.docker.io`。逻辑 Registry 的 deny 优先于 allow；这些规则不代替 realm/CDN 的 TLS 与拨号地址校验。Mirror 用 go-containerregistry 完成匿名 Bearer 握手，不用客户端入站凭据回源。 |
+| 0002 §1、§4、[0001](../.omp/specs/0001-lazy-mirror.md) §3、§6：回源 | 用 [Distribution reference](https://pkg.go.dev/github.com/distribution/reference#ParseNormalizedNamed) 规范化上游。Docker Hub 短名自动映射，官方镜像补 `library/`，并访问 `registry-1.docker.io`。逻辑 Registry 的 deny 优先于 allow；这些规则不代替 realm/CDN 的 TLS 与拨号地址校验。Mirror 用 go-containerregistry 完成上游认证，不用客户端入站凭据回源。 |
 | 0001 §4：Manifest | 按请求独立获取原始 Manifest，不拉取 config、层或 Index 的子 Manifest。支持 OCI Image Manifest / Image Index 与 Docker schema 2 Manifest / Manifest List。Tag 和 digest 绑定持久化；已固定的 Tag 不随公网更新而刷新。 |
 | 0002 §5、0001 §2.2：Blob | 一次冷读只下载目标 digest，并发读者共用同一个生产者。可信长度的完整冷 GET 可以读取正在写入的暂存前缀；末尾至少一字节在验证和发布后发送。冷 Range 等整块校验发布后才从正式缓存返回 `206` 或 `416`。 |
 
@@ -42,7 +42,7 @@ Zot 的 HTTP Basic 可由 `http.auth.htpasswd.path` 与可选的 `http.accessCon
 
 规范化不改变后端仓库、鉴权 scope 或覆盖 Tag。缓存同时按下游原仓库名和规范化上游来源隔离；`alpine`、`library/alpine`、`docker.io/library/alpine` 即使同指一个上游，也各自持有缓存。Tag 省略时由 OCI 客户端请求 `latest`；协议层仍要求有效 Tag 或 SHA-256 digest。
 
-改动入口：[`main.go`](../cmd/oci-mirror/main.go) 处理后端转发和回退；[`resolver.go`](../cmd/oci-mirror/resolver.go) 负责引用规范化和回退策略；[`upstream.go`](../cmd/oci-mirror/upstream.go) 封装匿名上游与出站策略；[`cache.go`](../cmd/oci-mirror/cache.go) 负责 Manifest 固定、Blob 下载和校验发布；[`blobstream.go`](../cmd/oci-mirror/blobstream.go) 负责并发读者的暂存出流和响应中止。
+改动入口：[`main.go`](../cmd/oci-mirror/main.go) 处理后端转发和回退；[`resolver.go`](../cmd/oci-mirror/resolver.go) 负责引用规范化和回退策略；[`upstream.go`](../cmd/oci-mirror/upstream.go) 负责上游请求与出站策略，[`upstreampool.go`](../cmd/oci-mirror/upstreampool.go) 管理鉴权上下文和匿名回退；[`cache.go`](../cmd/oci-mirror/cache.go) 负责 Manifest 固定、Blob 下载和校验发布；[`blobstream.go`](../cmd/oci-mirror/blobstream.go) 负责并发读者的暂存出流和响应中止。
 
 ### 持久缓存与配额
 

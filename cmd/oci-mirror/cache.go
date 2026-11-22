@@ -61,12 +61,12 @@ type manifest struct {
 	body              []byte
 }
 
-func newMirrorCache(ctx context.Context, dir string, transport http.RoundTripper, limits cacheLimits, upstreamLimit upstreamLimits) (*mirrorCache, error) {
+func newMirrorCache(ctx context.Context, dir string, transport http.RoundTripper, limits cacheLimits, upstreamLimit upstreamLimits, auth upstreamAuth) (*mirrorCache, error) {
 	if err := limits.validate(); err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	upstream, err := newUpstreamPool(ctx, transport, upstreamLimit)
+	upstream, err := newUpstreamPool(ctx, transport, upstreamLimit, auth)
 	if err != nil {
 		cancel()
 		return nil, err
