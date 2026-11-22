@@ -1,28 +1,27 @@
-# Zot 覆盖 PoC：架构与手工验收
+# 内网 Registry Mirror：架构与手工验收
 
 ## 实现边界
 
 ```text
-客户端 → HTTPS 入口 → Mirror → 私有直连回环上的专用 Zot
-           └── 签发端       └── 已授权的可信本地 miss → Mirror 缓存或匿名 HTTPS 上游
+客户端 → HTTPS 入口 → Mirror → 私有 Registry 后端（Zot 或 Distribution）
+           └── 可选签发端   └── 可信本地缺失 → Mirror 缓存或匿名 HTTPS 上游
 ```
 
 ### 下游认证与可信本地缺失
 
-启用回退必须设置 `-zot-config`，将同一份不可变 JSON 只读提供给 Zot 和 Mirror。专用 Zot 只能选择以下一种认证；不支持 OIDC、混合认证、集群或远端同步（`extensions.sync`）。不热更新配置；修改后协调重启两端。启动时 Mirror 直连 Zot `/v2/` 确认返回本模式的无凭据 `401` 挑战。这个探测不是配置或版本证明：操作者仍必须部署同一份配置、保证 Mirror→Zot 私有直连回环且无中间代理，并在升级 Zot 后重新验证授权及可信缺失语义。
+Mirror 通过 `-backend` 连接受信任的私有 Registry HTTP/HTTPS origin；非回环连接应使用 HTTPS。正常 `/v2/` 探测和具体资源请求都由反向代理转发，保留客户端 `Authorization` 和后端认证挑战。Mirror 不读后端认证配置、密码文件、JWT 证书或 issuer，不执行独立的启动鉴权探测；即使 `/v2/` 成功，也不代表对某个仓库有 `pull` 权限。
 
-- **HTTP Basic：** 仅配置 `http.auth.htpasswd.path`（绝对路径），不传 `-jwt-issuer`。Mirror 不读取密码文件；Zot 验证密码，并按配置执行可选 `http.accessControl` 的原仓库读取 ACL。只有带一份语法有效的 Basic 凭据、且通过 Zot 鉴权得到可信缺失的读请求才能回退。Basic 模式移除 Zot UI 会话 Cookie 和会话请求头；不能用 UI 会话替代 Registry Basic。客户端到入口应使用 HTTPS。
-- **传统 Bearer JWT：** 配置 `http.auth.bearer`，不配置 `http.accessControl`；`-jwt-issuer` 等于 docker-auth 的 `token.issuer`。`http.auth.bearer.cert` 使用两端都能读取的同一绝对路径，提供同一份签名公钥证书；`service` 和 `realm` 分别确定预期 `aud` 和挑战端点。
+后端须先按原始仓库及操作鉴权，再查找本地存储；不得把未授权、权限隐藏或故障伪装成类型化缺失。不要在后端启用 Distribution proxy、Zot Sync 等代理缓存或远端同步来承担本地优先覆盖。Mirror 不重写 `Location`；Distribution 应设 `http.relativeurls: true` 或在 `http.host` 配置客户端可达的入口 URL。
 
-Mirror 验证 Registry Bearer JWT 的 RSA RS256 签名、`iss`、`aud`、`exp`、可选 `nbf` / `iat` 及非空 `sub`。Zot 仍负责仓库和操作权限及写入。回退还要求 token 对**下游原始仓库名**具有 `pull` scope。参考 [docker-auth ACL](https://github.com/cesanta/docker_auth/blob/1.14.0/examples/reference.yml)，在专用 writer、拒绝和私有仓库规则之后，对已认证账号与带 Registry 域名的仓库发布默认 `pull` scope，见 [README](../README.md#本机启动)。普通本地短名不继承这条默认授权；显式仓库的本地同名覆盖和上游共享同一仓库 ACL。
+Zot 的 HTTP Basic 可由 `http.auth.htpasswd.path` 与可选的 `http.accessControl` 配置；传统 Bearer JWT 则在 Zot 中设置 `http.auth.bearer`，Nginx 可将 `/auth` 转给 docker-auth，示例见 [README](../README.md#本机启动)。后端和签发端按原始仓库名授权，包括本地短名。Zot v2.1.15 曾接受同一签发密钥签出的错误 audience token，且不强制 issuer。生产应选用 Zot Basic 或经独立验证能正确执行 JWT 签名、声明与资源 scope 检查的后端（例如按部署验证过的 Distribution Token Auth）。旧版 Mirror 的 JWT 检查不再提供独立保证。
 
-回退只信任与原请求相符的 Zot JSON `404`：`NAME_UNKNOWN` 必须匹配原仓库名，`MANIFEST_UNKNOWN` 匹配 Manifest 引用，`BLOB_UNKNOWN` 匹配 Blob digest；裸 `404`、不匹配的错误、鉴权挑战与后端故障均不触发回退。GET 原样先发往 Zot，绝不预检 HEAD；仅 Manifest GET 的 `NAME_UNKNOWN` 需要事后用同资源 HEAD 的 `404` 佐证，因为 Zot v2.1.15 的坏仓库布局在 GET 上也会返回此错误，但 HEAD 返回 `500`。初始 Manifest HEAD 的 `404` 没有响应体，只用后续一次直连 GET 验证有匹配的类型化 `404`。探测不一致则保留首次响应；探测不是原子快照，不能与并发 Push 串行化。Blob HEAD 从不回退。
+回退只信任与原请求相符的 Registry JSON `404`（`NAME_UNKNOWN`、`MANIFEST_UNKNOWN` 或 `BLOB_UNKNOWN`）；裸 `404`、不匹配的错误、鉴权挑战与后端故障均不触发回退。GET 先原样发给后端；Manifest GET 的 `NAME_UNKNOWN` 用同资源 HEAD 的 `404` 佐证，因为 Zot v2.1.15 的坏仓库布局在 GET 上也会返回此错误，但 HEAD 返回 `500`。初始 Manifest HEAD 的 `404` 没有响应体，用同资源 GET 验证类型化 `404`。探测不一致则保留首次响应；探测不是原子快照，不能与并发 Push 串行化。Blob HEAD 从不回退。
 
 ### 匿名上游与出站策略
 
-通过下游授权并确认可信缺失后，默认允许符合出站规则的显式 Registry；可选 allow 列表缩小范围，deny 始终优先；短名仍须逐个启用。回源只用匿名 HTTPS/443，以系统 CA 校验证书，并校验实际拨号地址。默认拒绝解析到非公网地址的主机。仅在受控私有部署且使用受管理 DNS 时，操作者才应按确切 FQDN 显式配置 `-poc-private-dns-host`（例如 `r.ltkk.run`）。可重复配置；不匹配父域或通配符，Registry、Bearer realm 和重定向目标分别检查。此例外只允许相应 DNS 返回的 RFC 1918 / IPv6 ULA 地址，不允许直接使用私网 IP 字面量，也不放行回环、链路本地或元数据目的地。是否加入名单是独立于公开 DNS 或证书签发的管理决策；有效证书不能代替出站授权。
+确认可信本地缺失后始终可按策略回退，短名自动归一到 Docker Hub。`-deny-registry` 优先于 `-allow-registry`；allow 为空时允许所有未被 deny 的逻辑 Registry（包括 Docker Hub），非空时仅允许列出的 Registry。回源只用匿名 HTTPS/443，以系统 CA 校验证书，并校验实际拨号地址。默认拒绝解析到非公网地址的主机。仅在受控私有部署且使用受管理 DNS 时，操作者才应按确切 FQDN 显式配置 `-private-dns-host`（例如 `r.ltkk.run`）。可重复配置；不匹配父域或通配符，Registry、Bearer realm 和重定向目标分别检查。此例外只允许相应 DNS 返回的 RFC 1918 / IPv6 ULA 地址，不允许直接使用私网 IP 字面量，也不放行回环、链路本地或元数据目的地。是否加入名单是独立于公开 DNS 或证书签发的管理决策；有效证书不能代替出站授权。
 
-匿名 Registry 请求复用同一 HTTP Transport 和连接池。鉴权上下文以 Registry API 主机与规范化仓库的 `pull` scope 为键，不跨仓库共享 token；下游身份、缓存归属和 Zot 路由继续使用原始仓库名。一个上游 Registry 的令牌桶计量注册表探测、令牌请求及重定向后的 CDN 请求；缓存命中不消耗出站额度。
+匿名 Registry 请求复用同一 HTTP Transport 和连接池。鉴权上下文以 Registry API 主机与规范化仓库的 `pull` scope 为键，不跨仓库共享 token；下游身份、缓存归属和后端路由继续使用原始仓库名。一个上游 Registry 的令牌桶计量注册表探测、令牌请求及重定向后的 CDN 请求；缓存命中不消耗出站额度。
 
 | 参数 | 默认 | 含义 |
 | --- | --- | --- |
@@ -33,21 +32,21 @@ Mirror 验证 Registry Bearer JWT 的 RSA RS256 签名、`iss`、`aud`、`exp`�
 
 | 规格 | PoC 的行为 |
 | --- | --- |
-| [0002](../.omp/specs/0002-mirror-zot-overlay.md) §2：Zot 优先 | Manifest `GET`/`HEAD` 与 Blob `GET`（含 `Range`）先用原方法访问 Zot；只有已授权、符合策略的可信本地缺失才回退。缓存不能跳过 Zot。Blob `HEAD`、上传、会话、mount、PUT、DELETE 和发现接口仍走 Zot。 |
-| 0002 §3：同名覆盖 | 新 Push 提交后，下一次 Tag 读取优先返回 Zot；按公网旧 digest 读取不转成 Tag 查找。删除本地 Tag 后可再次露出 Mirror 固定版本，不建立屏蔽记录。 |
-| 0002 §1、§4、[0001](../.omp/specs/0001-lazy-mirror.md) §3、§6：回源 | 用 [Distribution reference](https://pkg.go.dev/github.com/distribution/reference#ParseNormalizedNamed) 规范化上游。Docker Hub 补 `library/` 并访问 `registry-1.docker.io`；显式仓库可动态回源，短名需逐个批准。逻辑 Registry 的 deny 优先于 allow；这些规则不代替 realm/CDN 的 TLS 与拨号地址校验。Mirror 用 go-containerregistry 完成匿名 Bearer 握手，不用客户端入站凭据回源。 |
+| [0002](../.omp/specs/0002-mirror-zot-overlay.md) §2：本地优先 | Manifest `GET`/`HEAD` 与 Blob `GET`（含 `Range`）先用原方法访问后端；只有符合策略的可信本地缺失才回退。缓存不能跳过后端。Blob `HEAD`、上传、会话、mount、PUT、DELETE 和发现接口仍走后端。 |
+| 0002 §3：同名覆盖 | 新 Push 提交后，下一次 Tag 读取优先返回后端版本；按公网旧 digest 读取不转成 Tag 查找。删除本地 Tag 后可再次露出 Mirror 固定版本，不建立屏蔽记录。 |
+| 0002 §1、§4、[0001](../.omp/specs/0001-lazy-mirror.md) §3、§6：回源 | 用 [Distribution reference](https://pkg.go.dev/github.com/distribution/reference#ParseNormalizedNamed) 规范化上游。Docker Hub 短名自动映射，官方镜像补 `library/`，并访问 `registry-1.docker.io`。逻辑 Registry 的 deny 优先于 allow；这些规则不代替 realm/CDN 的 TLS 与拨号地址校验。Mirror 用 go-containerregistry 完成匿名 Bearer 握手，不用客户端入站凭据回源。 |
 | 0001 §4：Manifest | 按请求独立获取原始 Manifest，不拉取 config、层或 Index 的子 Manifest。支持 OCI Image Manifest / Image Index 与 Docker schema 2 Manifest / Manifest List。Tag 和 digest 绑定持久化；已固定的 Tag 不随公网更新而刷新。 |
 | 0002 §5、0001 §2.2：Blob | 一次冷读只下载目标 digest，并发读者共用同一个生产者。可信长度的完整冷 GET 可以读取正在写入的暂存前缀；末尾至少一字节在验证和发布后发送。冷 Range 等整块校验发布后才从正式缓存返回 `206` 或 `416`。 |
 
 冷获取的 Manifest 上限为 4 MiB、30 秒，Blob 上限为 2 GiB、10 分钟。固定 Tag 不等于所有依赖都已离线可读。
 
-规范化不改变 Zot 仓库、JWT scope 或覆盖 Tag。缓存同时按下游原仓库名和规范化上游来源隔离；`alpine`、`library/alpine`、`docker.io/library/alpine` 即使同指一个上游，也各自持有缓存。Tag 省略时由 OCI 客户端请求 `latest`；协议层仍要求有效 Tag 或 SHA-256 digest。
+规范化不改变后端仓库、鉴权 scope 或覆盖 Tag。缓存同时按下游原仓库名和规范化上游来源隔离；`alpine`、`library/alpine`、`docker.io/library/alpine` 即使同指一个上游，也各自持有缓存。Tag 省略时由 OCI 客户端请求 `latest`；协议层仍要求有效 Tag 或 SHA-256 digest。
 
-改动入口：[`main.go`](../cmd/oci-mirror/main.go) 保留 Zot 转发和回退判断；[`resolver.go`](../cmd/oci-mirror/resolver.go) 负责引用规范化和回退策略；[`upstream.go`](../cmd/oci-mirror/upstream.go) 封装匿名上游与出站策略；[`cache.go`](../cmd/oci-mirror/cache.go) 负责 Manifest 固定、Blob 下载和校验发布；[`blobstream.go`](../cmd/oci-mirror/blobstream.go) 负责并发读者的暂存出流和响应中止。
+改动入口：[`main.go`](../cmd/oci-mirror/main.go) 处理后端转发和回退；[`resolver.go`](../cmd/oci-mirror/resolver.go) 负责引用规范化和回退策略；[`upstream.go`](../cmd/oci-mirror/upstream.go) 封装匿名上游与出站策略；[`cache.go`](../cmd/oci-mirror/cache.go) 负责 Manifest 固定、Blob 下载和校验发布；[`blobstream.go`](../cmd/oci-mirror/blobstream.go) 负责并发读者的暂存出流和响应中止。
 
 ### 持久缓存与配额
 
-启用回退时，每个 Mirror 进程使用一个专用的本地持久目录，不与其他进程共享。`<cache-dir>/mirror-v1/catalog.sqlite` 使用 SQLite WAL 与 `synchronous=FULL`，记录不可变的原始 Manifest 字节、上游来源与下游仓库、Tag 和 digest 绑定、Blob 描述符长度及已发布的 Blob 记录。`mirror-v1/staging/` 存放下载中的临时文件，`mirror-v1/blobs/` 存放已校验发布的 Blob。
+`-cache-dir` 必填。每个 Mirror 进程使用一个专用的本地持久目录，不与其他进程共享。`<cache-dir>/mirror-v1/catalog.sqlite` 使用 SQLite WAL 与 `synchronous=FULL`，记录不可变的原始 Manifest 字节、上游来源与下游仓库、Tag 和 digest 绑定、Blob 描述符长度及已发布的 Blob 记录。`mirror-v1/staging/` 存放下载中的临时文件，`mirror-v1/blobs/` 存放已校验发布的 Blob。
 
 重启恢复固定记录与已发布的 Blob，清理中断的暂存文件及孤立文件，并按调低后的 Blob 配额淘汰载荷，不修剪 Manifest 固定记录。已初始化的缓存丢失目录数据库时启动失败，不会静默创建新库并重新固定 Tag。旧布局在 `mirror-v1/` 旁的缓存文件不会被读取、迁移或删除。
 
@@ -64,7 +63,7 @@ Mirror 验证 Registry Bearer JWT 的 RSA RS256 签名、`iss`、`aud`、`exp`�
 | `-cache-fetches` | 4 | 全局并行冷回源请求 |
 | `-cache-upstream-fetches` | 2 | 每个逻辑 Registry 的并行冷回源请求 |
 
-例如，将下列参数加到已配置认证和回退的 Mirror 启动命令，前提是专用目录已由运维人员准备且运行用户可写：
+例如，以下参数可用于指定缓存目录并限制 Blob 容量，前提是专用目录已由运维人员准备且运行用户可写：
 
 ```text
 -cache-dir /var/lib/oci-mirror/cache -cache-blob-bytes 8589934592 -cache-blob-entries 5000
@@ -74,7 +73,7 @@ Mirror 验证 Registry Bearer JWT 的 RSA RS256 签名、`iss`、`aud`、`exp`�
 
 Manifest 固定记录不淘汰；额度不足时新增绑定返回 `507`。Blob 淘汰采用近似 LRU，跳过正在读取的载荷，最近访问时间按一秒粒度更新。已发布载荷预算不含 SQLite 元数据及 WAL 开销，也不含暂存和旧布局文件；这些参数不是物理磁盘用量的硬上限。需要硬上限时另设文件系统配额，并为目录数据库与 WAL 留出空间。
 
-### 持久缓存实测
+### 持久缓存历史实测
 
 在保留的 Zot 和 docker-auth 上，用专用缓存目录触发 `SIGKILL` 后重启，并移除 `r.ltkk.run` 的私网出站例外。相同 Tag、digest、原始 Manifest 字节和 Blob 仍命中，新的冷 Tag 因无法回源返回 `502`。SQLite 中保有原 Manifest 的 Blob 描述符；中断 staging 与无目录记录的 Blob 文件被清理，旧布局文件未触碰。第二个 Mirror 不能同时打开该目录。
 
@@ -104,7 +103,13 @@ Manifest 固定记录不淘汰；额度不足时新增绑定返回 `507`。Blob 
 
 新版留存入口通过本机 Docker Engine 拉取 `registry.k8s.io/pause:3.9`，以及本机 Skopeo 拉取 `docker.io/library/alpine:3.22` 并核对镜像层摘要。这两项是实际 Registry 的正常拉取回归，断线续传由上面的受控场景验收。
 
-### 本轮认证、复用与 S3 验收
+### 通用后端验收
+
+使用 `-backend` 和独立空缓存实测 Distribution 2.8.3（Basic 和传统 Bearer）、Zot 2.1.23（Basic）及 Zot 2.1.15（传统 Bearer）。`/v2/` 与具体资源的 `401` 挑战保持原样，Bearer 资源挑战包含原仓库 scope；匿名、错误密码或错误仓库 scope 在预热后仍被拒绝。授权 Manifest GET/HEAD 可从后端类型化 `404` 回退，后端已有的同名 Tag 优先。Blob GET 回源后核对 SHA-256，Blob HEAD 冷、热仍返回后端 `404`。
+
+Skopeo 在 Distribution Basic 入口直接拉取短名 `alpine:3.22` 并完成镜像复制；显式上游 `registry.k8s.io/pause:3.9` 的 GET/HEAD 也通过。新版另经 Zot 2.1.23 复测 RustFS：完整 Blob GET 的签名 `307 Location` 原样透传，可直接下载并校验；Range 仍由 Zot 返回 `206`。Zot 的 Bearer 测试覆盖 scope，不代表其 issuer 或 audience 校验通过。
+
+### 历史认证、复用与 S3 验收
 
 - **Basic：** 实际 Zot v2.1.15 使用两个 htpasswd 账号验证 `registry.k8s.io/pause:3.10`。有 `read` 权限的账号在空缓存和热缓存都得到 `200`，直接 Zot 返回 `404 NAME_UNKNOWN`；未登录和密码错误均为 `401`，有效账号没有仓库 `read` 权限时冷、热均为 `403`。Skopeo 复制了 linux/amd64 镜像，Manifest、config 和 layer 均核对摘要。Blob `GET` 成功，冷、热 Blob `HEAD` 仍与 Zot 一样返回 `404`。
 - **出站复用：** 顺序 TLS 验收里，同一仓库两次 Manifest GET 和一次经 CDN 的 Blob GET 共用一次匿名令牌交换。另一个仓库和另一个 Registry 各自获取 token；同源资源 `401` 触发一次重新握手，响应挑战不能把别的仓库 scope 加进新令牌。耗尽一个 Registry 的突发额度不妨碍另一个 Registry 发请求。没有运行并发压测。
@@ -121,9 +126,9 @@ Manifest 固定记录不淘汰；额度不足时新增绑定返回 `507`。Blob 
 
 签名 URL 不带 Registry `Authorization` 可直接从 RustFS 下载并通过 OCI 层摘要校验；移除签名查询参数则返回 `403`。Mirror 不跟随或改写 Zot 的 `Location`。部署时 S3 签名 URL 必须对客户端可达，且应使用受信任的 HTTPS；隔离 fixture 中的私网 HTTP 地址不适用于对外部署。
 
-### 原生客户端 JWT/TLS 拉取
+### 历史原生客户端 JWT/TLS 拉取
 
-新版 Mirror 使用独立空缓存，复用留存 Zot、签发端和私有 CA，不修改留存入口。三个客户端各自从空客户端存储起步，选中 `linux/amd64`，随后分别用原客户端存储和全新客户端存储再次拉取。Mirror 的发布日志确认各 Tag 的 Index、所选子 Manifest 和 Zot 缺失的 Blob 已冷回源；`pause:3.10` 的 config Blob 已在 Zot，直接由 Zot 提供。
+当时的 Mirror 使用独立空缓存，复用留存 Zot、签发端和私有 CA，不修改留存入口。三个客户端各自从空客户端存储起步，选中 `linux/amd64`，随后分别用原客户端存储和全新客户端存储再次拉取。Mirror 的发布日志确认各 Tag 的 Index、所选子 Manifest 和 Zot 缺失的 Blob 已冷回源；`pause:3.10` 的 config Blob 已在 Zot，直接由 Zot 提供。
 
 | 客户端 | `registry.k8s.io/pause` Tag | 所选 Manifest SHA-256 |
 | --- | --- | --- |
@@ -163,16 +168,24 @@ docker --config "$scratch/docker" login --username reader --password-stdin \
 issue_headers
 
 # 不带身份、或身份有效但没有原始仓库的 pull scope，都不是可回退的缺失。
-test "$(edge_curl -sS -o /dev/null -w '%{http_code}' \
-  "$mirror/v2/$repo/manifests/$tag")" = 401
+check_auth_denial() {
+  local status
+  status=$(edge_curl -sS -D "$scratch/denial.headers" -o /dev/null \
+    -w '%{http_code}' "$@" "$mirror/v2/$repo/manifests/$tag")
+  case "$status" in
+    401) grep -qi '^WWW-Authenticate:' "$scratch/denial.headers" ;;
+    403) : ;;
+    *) printf '预期后端拒绝，实际 HTTP %s\n' "$status" >&2; return 1 ;;
+  esac
+}
+check_auth_denial
 wrong=$(issue_token reader 'repository:docker.io/library/busybox:pull')
 printf 'Authorization: Bearer %s\n' "$wrong" >"$scratch/wrong.headers"
 unset wrong
-test "$(edge_curl -sS -H "@$scratch/wrong.headers" -o /dev/null -w '%{http_code}' \
-  "$mirror/v2/$repo/manifests/$tag")" = 401
+check_auth_denial -H "@$scratch/wrong.headers"
 ```
 
-手工分阶段操作超过 token 的 `900` 秒有效期时，重新运行 `issue_headers`。
+认证失败的状态和挑战由后端决定：挑战通常是带 `WWW-Authenticate` 的 `401`，也可能直接拒绝为 `403`。手工分阶段操作超过 token 的 `900` 秒有效期时，重新运行 `issue_headers`。
 
 ### 1. 固定公网 Manifest，验证冷 Blob HEAD
 
@@ -347,39 +360,31 @@ printf '公网/回退根 digest: %s\n旧子清单 digest: %s\nZot 覆盖 digest:
   "$public_digest" "$child_digest" "$overlay_digest"
 ```
 
-### 5. Zot 不可达时不读热缓存
-
-仅在 README 新建的临时环境（**不在留存 fixture**）检查失败路径：在清理前停止本次 Zot。尽管 Tag 已在 Mirror 缓存，入口仍应返回 `502`：
-
-```bash
-docker stop "$zot_id" >/dev/null
-zot_id=
-test "$(mirror_curl -sS -o /dev/null -w '%{http_code}' "$mirror$api/manifests/$tag")" = 502
-```
+后端不可达不是可信缺失；即使缓存中有固定 Tag，也不得跳过后端。当前 smoke 流程不以停掉后端来注入故障。
 
 不要在 Push 之后用共享层的 Range 探测 Mirror 的 `416`：Zot 已有这个层，响应由 Zot 决定。Zot v2.1.15 实测对该层的越界 Range 返回 `500`，Mirror 按规格透传，不回退。
 
 检查所需日志后在子 shell 执行 `exit`，由 [README 的清理流程](../README.md#验收与清理) 停止服务并移除临时文件。要重跑，请重新创建空环境。
 
-## 本轮 P0 实测
+## 历史 P0 实测（旧版 Mirror）
 
-- 本机 Skopeo 1.22.0 一次登录完成 `r.ltkk.run/library/alpine:latest` 的冷拉、同名 OCI 覆盖、覆盖版回读、旧 digest 读取和删除后回退。错误 `aud` 的读写、错误 `iss`、过期、缺 `exp`、未来 `nbf`、错误签名、错误仓库 scope 和匿名热读均返回 `401`。
+- 本机 Skopeo 1.22.0 一次登录完成 `r.ltkk.run/library/alpine:latest` 的冷拉、同名 OCI 覆盖、覆盖版回读、旧 digest 读取和删除后回退。当时错误 `aud` 的读写、错误 `iss`、过期、缺 `exp`、未来 `nbf`、错误签名、错误仓库 scope 和匿名热读均返回 `401`。这些结果包含旧版 Mirror 独立验证 JWT 的行为，不是当前版本的认证保证；当前结果取决于后端。
 - 本机 Docker Engine 28.5.2 完成 `registry.k8s.io/pause:3.10` 的登录和 `linux/amd64` 冷拉。Zot 初次因未启用 Docker schema 2 兼容项返回 `415`；设置 `http.compat: ["docker2s2"]` 后，已验证 `p0-docker-smoke` 标签 Push 成功。宿主机的 hosts、证书和默认 Docker daemon 配置均未改动，测试使用了隔离挂载和临时 Docker daemon。
 - 留存的 Zot 通过入口处理分块上传，`POST` / `PATCH` 返回 `202`；查询会话返回 `204` 和正确的 Range，Location 保持相对路径。带源和目标仓库 scope 的跨仓库 mount 由 Zot 返回 `201`。
 - 默认签发 ACL 与默认 Registry allow 实测拉取未单列的 `quay.io/libpod/alpine:latest`；没有额外授权的本地短名仍返回 `401`。
 - 受控上游日志显示：裸 `404`、`DENIED`、错误 detail、后端 HEAD/GET 不一致和 `429` 都未产生回源；有效缺失才回源。匿名 token realm 无入站凭据，Registry 只收到自己的上游 Bearer token，跨域 CDN 无 Authorization 或 Cookie。私网 Registry 和重定向 CDN 均须各自显式允许，deny 优先于 allow。
 
-## 历史记录（切换前，不是上述认证流程的验收）
+## 更早的匿名 PoC 与动态回源历史记录
 
-旧版匿名 PoC 曾在 Zot v2.1.15、Skopeo v1.22.0 上通过当时的五阶段流程。公网根清单为 `sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a`，同名 Zot 覆盖为 `sha256:63881a70fa9f26ae2feb4987058dd5a0b1fb93f823b5d3d1e96a4103724aadec`；删除后字节级恢复公网根清单。旧匿名回退配置已不允许启动。
+旧版匿名 PoC 曾在 Zot v2.1.15、Skopeo v1.22.0 上通过当时的五阶段流程。公网根清单为 `sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a`，同名 Zot 覆盖为 `sha256:63881a70fa9f26ae2feb4987058dd5a0b1fb93f823b5d3d1e96a4103724aadec`；删除后字节级恢复公网根清单。
 
 私网 DNS 例外单独验收：未配置 allowlist 或只列 `ltkk.run` 时 `r.ltkk.run` 的冷读返回 `502`；列精确主机 `r.ltkk.run` 后通过 Skopeo 完整匿名拉取 `library/alpine:latest`，Manifest 原始字节和层 SHA-256 均与上游一致。直接配置 `172.16.56.2` 为仓库主机或 allowlist 项都被拒绝。
 
-动态回源在隔离 JWT fixture 下实测完整拉取 `registry.k8s.io/pause:3.10`、`r.ltkk.run/library/alpine:latest` 和省略 Tag 的 `docker.io/library/alpine`，并校验落盘层摘要。两个短名默认不回退，逐个批准后可拉取；三个 Docker Hub 拼写和 `r.ltkk.run` 上碰巧相同的 Blob 分别保存在四个独立缓存作用域。显式名的 JWT 不能授权短名（`401`）；Registry 同时在 allowlist 和 denylist 时不回源（`404`）。
+动态回源在隔离 JWT fixture 下实测完整拉取 `registry.k8s.io/pause:3.10`、`r.ltkk.run/library/alpine:latest` 和省略 Tag 的 `docker.io/library/alpine`，并校验落盘层摘要。当时两个短名默认不回退，逐个批准后可拉取；三个 Docker Hub 拼写和 `r.ltkk.run` 上碰巧相同的 Blob 分别保存在四个独立缓存作用域。显式名的 JWT 不能授权短名（`401`）；Registry 同时在 allowlist 和 denylist 时不回源（`404`）。当前版本不再要求逐个批准短名，但仍由后端按原仓库名决定授权。
 
 ### 复用留存的 JWT fixture
 
-若本机已建好留存 fixture，连接配置在 `.git/oci-mirror-jwt-fixture/env`，与 README 的临时环境无关。不要运行上面的停止 Zot、删除覆盖或清理步骤；仅使用读取命令。宿主机和 Docker daemon 已能解析该域名并信任 fixture CA 时，直接使用宿主机上的 Skopeo 和 Docker：
+若本机已建好留存 fixture，连接配置在 `.git/oci-mirror-jwt-fixture/env`，与 README 的临时环境无关。不要停止 Zot、删除覆盖或运行临时环境的清理步骤；仅使用读取命令。宿主机和 Docker daemon 已能解析该域名并信任 fixture CA 时，直接使用宿主机上的 Skopeo 和 Docker：
 
 ```bash
 source .git/oci-mirror-jwt-fixture/env
@@ -408,6 +413,6 @@ docker run --rm --network "$JWT_NETWORK" --add-host "$JWT_HOST:$JWT_IP" \
 
 ## 延后项与下一阶段顺序
 
-1. **部署验证。** 信任边界仅涵盖专用 Zot 的 htpasswd Basic 或传统 Registry Bearer JWT，不支持 OIDC、权限隐藏型后端、集群或远端同步。上线前按部署采用的认证、访问策略与 Zot 版本复核授权和可信缺失契约。
+1. **部署验证。** 上线前用选定的后端版本和认证配置核对具体资源的鉴权、可信缺失及 `Location` 可达性。若后端用类型化缺失隐藏拒绝、或启用其自身的回源代理，则不满足本地优先契约。
 2. **续传兼容性。** 本实现只续传一次完整剩余区间，暂不支持依赖续传重定向、分段返回或多次续传的上游。普通下载仍不分片、不并行。
 3. **客户端边界。** 只声明实测的版本、拉取方式和平台。若某客户端依赖 Blob HEAD `200` 才能 Pull，不能靠伪造成功响应通过验收。本轮不追加 Zot 故障注入和后端超时验收。

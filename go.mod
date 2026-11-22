@@ -4,7 +4,6 @@ go 1.25.0
 
 require (
 	github.com/distribution/reference v0.6.0
-	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/go-containerregistry v0.22.1
 	golang.org/x/time v0.14.0
 	modernc.org/sqlite v1.54.0

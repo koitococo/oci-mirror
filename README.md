@@ -1,8 +1,14 @@
-# OCI Mirror + Zot 覆盖 PoC
+# OCI Registry Mirror
+
+这是一个部署在可信内网的通用 Registry Mirror；认证和授权由后端负责，不额外叠加偏离这一定位的限制。
+
+## 后端与信任边界
 
 同一个引用（例如 `mirror-poc.test:15443/registry.k8s.io/pause:3.10`）可以先从公网 Pull，再由正常 Push 写入 Zot 并覆盖该 Tag。删除 Zot 的覆盖后，入口重新返回 Mirror 固定的公网版本。Mirror 缓存不写入 Zot，也不会让 Push 误以为 Zot 已有某个 Blob。
 
-**回退必须认证。** 客户端只连接受信任的 HTTPS 入口；Mirror 与专用 Zot 之间走私有直连回环。Zot 是本地存储和写入的权威，Mirror 不会用缓存代替 Zot 的上传检查。不带 JWT 配置只能运行仅转发模式，不能启用回退。
+`-backend` 指定受操作者信任的私有 HTTP/HTTPS Registry origin（可使用 IP 或 DNS 名称；非回环连接应使用 HTTPS），`-cache-dir` 必填，`-listen` 只接受 IP 字面量形式的回环地址和端口。后端可使用符合下述契约的 Zot 或 Distribution。客户端连接受信任的 HTTPS 入口；Mirror 原样转发正常的 `/v2/` 探测与具体资源请求的 `Authorization`，并透传后端认证挑战。Mirror 不配置认证、不读取 JWT 证书或 issuer，也不会把 `/v2/` 成功当作具体仓库的拉取授权。
+
+后端是本地存储和写入的权威：须先执行具体资源的鉴权再查找，不得把拒绝或故障伪装成类型化缺失。使用本地优先语义时，不能启用后端自身的代理缓存（如 Distribution proxy 或 Zot Sync）。Mirror 不用缓存代替后端上传检查，也不重写 `Location`；Distribution 应配置 `http.relativeurls: true` 或将 `http.host` 指向客户端可达的公开入口。
 
 ## 本机启动
 
@@ -67,7 +73,7 @@ users:
 acl:
   - match: {account: "writer", name: "$repo"}
     actions: ["pull", "push"]
-  - match: {account: '/.+/', type: repository, name: '/^[a-z0-9-]+([.][a-z0-9-]+)+[/].+$/'}
+  - match: {account: '/.+/', type: repository}
     actions: ["pull"]
 EOF
 jq --arg realm "$mirror/auth" --arg service "$authority" --arg cert "$scratch/signing.crt" \
@@ -110,9 +116,8 @@ zot_id=$(docker run --detach --rm --network host \
 test "$(curl -sS --max-time 2 --retry 15 --retry-all-errors --retry-delay 1 \
   -o /dev/null -w '%{http_code}' "$zot/v2/")" = 401
 
-"$scratch/oci-mirror" -listen 127.0.0.1:15000 -poc-zot "$zot" \
-  -zot-config "$scratch/zot.json" -jwt-issuer "$issuer" \
-  -poc-enable-fallback -poc-public-repo "$repo" -cache-dir "$scratch/cache" \
+"$scratch/oci-mirror" -listen 127.0.0.1:15000 -backend "$zot" \
+  -cache-dir "$scratch/cache" \
   >"$scratch/mirror.log" 2>&1 &
 mirror_pid=$!
 edge_id=$(docker run --detach --rm --network host \
@@ -124,27 +129,27 @@ test "$(curl -sS --cacert "$scratch/trust/ca.crt" --max-time 2 \
 kill -0 "$mirror_pid"
 ```
 
-该固定版本的 [Zot 镜像](https://github.com/project-zot/zot/blob/v2.1.15/build/stacker.yaml) 默认执行 `serve /etc/zot/config.json`。Zot 与 Mirror 使用同一个不可变 JSON 和同一个绝对路径下的公开签名证书。示例把临时 JSON、证书只读挂入 Zot，宿主机 Mirror 读取只读临时文件；实际部署应在两端均只读挂载同一配置和证书。签名私钥仅供签发端使用。`examples/zot-poc.json` 单独使用是匿名 **proxy-only** 配置；上面先派生认证配置，绝不要用原文件直接开启回退。
+该固定版本的 [Zot 镜像](https://github.com/project-zot/zot/blob/v2.1.15/build/stacker.yaml) 默认执行 `serve /etc/zot/config.json`。本例将派生的 JSON 和 JWT 签名公钥证书只读挂入 Zot；签名私钥仅供 Nginx `/auth` 转发到的签发端使用。Mirror 不读取这些文件。`examples/zot-poc.json` 本身未启用认证，不要直接替代本例派生的认证配置：允许匿名读取的本地后端也允许匿名请求在可信缺失后回退，并不会关闭回退。Zot v2.1.15 曾接受同一签发密钥签出的错误 audience token，且其传统 Bearer 验证不强制 issuer；生产使用 Zot Basic 或独立验证过签名、声明和资源 scope 的 JWT 后端，不要依靠旧版 Mirror 的 JWT 检查。
 
-这条默认 `pull` ACL 只覆盖带显式 Registry 域名的原始仓库名，不给普通本地短名自动授权。同名 Zot 覆盖与该仓库共享 `pull` 权限；需要保护的显式仓库必须在默认规则之前配置更具体的 ACL。经典 Docker Engine Push 如收到 Zot `415`，需在 Zot 的 `http` 中配置 `compat: ["docker2s2"]`；Mirror 不转换写入格式。
+本例允许已认证账号拉取任意仓库（包括短名），仅为所示仓库的 writer 额外授予 Push。需要保护的仓库应在默认规则之前配置更具体的 ACL；同名后端覆盖和上游回退共享原始仓库的读取权限。经典 Docker Engine Push 如收到 Zot `415`，需在 Zot 的 `http` 中配置 `compat: ["docker2s2"]`；Mirror 不转换写入格式。
 
-可将 `repo`、`tag` 改为 `r.ltkk.run/library/alpine`、`latest`，并额外传 `-poc-private-dns-host r.ltkk.run`。这只是启动示例的替代源；后面的多架构验收流程使用 `pause`。
+可将 `repo`、`tag` 改为 `r.ltkk.run/library/alpine`、`latest`，并额外传 `-private-dns-host r.ltkk.run`。这只是启动示例的替代源；后面的多架构验收流程使用 `pause`。
 
 ### HTTP Basic 模式
 
-也可将专用 Zot 配置改为仅使用 `http.auth.htpasswd.path`（绝对路径），将 htpasswd 文件只读挂载给 Zot，并从 Mirror 启动命令移除 `-jwt-issuer`。保留 `-zot-config`，客户端从 HTTPS 入口执行 Registry 登录；该模式不需要 docker-auth 或 `/auth` 路由。按需在 Zot `http.accessControl` 授予原仓库名的 `read` 权限；拒绝结果不会命中任何公网回源或 Mirror 缓存。不要混配 Basic、Bearer 或 OIDC。
+也可将专用 Zot 配置改为仅使用 `http.auth.htpasswd.path`（绝对路径），将 htpasswd 文件只读挂载给 Zot。Mirror 启动命令不变；客户端从 HTTPS 入口执行 Registry 登录。Basic 不需要 docker-auth 或 `/auth` 路由。按需在 Zot `http.accessControl` 授予原仓库名的 `read` 权限；后端拒绝不会触发公网回源或读取 Mirror 缓存。
 
 ## 动态上游
 
-通过下游授权、确认是可信本地缺失后，启用 `-poc-enable-fallback` 且省略 `-poc-public-repo` 即默认允许符合出站策略的显式 Registry，例如 `docker.io/library/alpine` 或 `registry.k8s.io/pause`。`-poc-allow-registry`、`-poc-deny-registry` 都可重复：未设置 allow 列表时不额外限制 Registry；配置 deny 时 deny 始终优先。只开放几个仓库时，重复 `-poc-public-repo` 限定范围；`alpine`、`library/alpine` 等短名必须逐个用该选项批准。不开 `-poc-enable-fallback` 时仅转发 Zot。
+具体资源得到可信本地缺失后，回退始终启用。`-allow-registry`、`-deny-registry` 都可重复，按规范化后的逻辑 Registry 匹配：deny 优先；allow 为空时不额外限制 Registry（包括 Docker Hub），非空时只允许列出的 Registry。上游连接仍必须通过出站策略。
 
-规范化只用于确定回源位置：Docker Hub 的 API 是 `registry-1.docker.io`，官方镜像补 `library/`；Zot 路径、JWT scope 和覆盖 Tag 保持客户端原仓库名，缓存同时按原仓库名和规范化来源隔离。上游须支持匿名 HTTPS/443，不能用路径指定端口、IP 或上游凭据。
+规范化只用于确定回源位置：`alpine`、`library/alpine` 自动回退到 Docker Hub，API 是 `registry-1.docker.io`，官方镜像补 `library/`。后端路径、鉴权 scope 和覆盖 Tag 保持客户端原仓库名，缓存同时按原仓库名和规范化来源隔离。短名的回源映射不授予后端读取权限。上游须支持匿名 HTTPS/443，不能用路径指定端口、IP 或上游凭据。
 
 匿名上游的连接池和同仓库 pull token 可复用；速率与鉴权上下文数有界，见[出站参数](docs/poc.md#匿名上游与出站策略)。
 
 ## 持久缓存
 
-启用回退时，将 `-cache-dir` 指向本机专用持久目录，只交给一个 Mirror 进程使用。重启会恢复固定的 Manifest 和 Tag；Blob 可按容量淘汰，固定 Tag 不保证依赖全部可离线读取。新布局不读取、不迁移也不删除旧缓存文件。[目录布局、配额参数和运维限制](docs/poc.md#持久缓存与配额)。
+将必填的 `-cache-dir` 指向本机专用持久目录，只交给一个 Mirror 进程使用。重启会恢复固定的 Manifest 和 Tag；Blob 可按容量淘汰，固定 Tag 不保证依赖全部可离线读取。新布局不读取、不迁移也不删除旧缓存文件。[目录布局、配额参数和运维限制](docs/poc.md#持久缓存与配额)。
 
 长度可信的完整冷 Blob GET 可以提前收到前缀；末尾至少一字节只会在校验和正式发布成功后发送。Range 和条件请求仍等正式缓存。前置代理须关闭 Registry 响应缓冲，或尊重 Mirror 的 `X-Accel-Buffering: no`；上面的 Nginx 示例已关闭 `/v2/` 的缓冲。
 
