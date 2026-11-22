@@ -24,14 +24,51 @@ Mirror 验证 Registry Bearer JWT 的 RSA RS256 签名、`iss`、`aud`、`exp`�
 | [0002](../.omp/specs/0002-mirror-zot-overlay.md) §2：Zot 优先 | Manifest `GET`/`HEAD` 与 Blob `GET`（含 `Range`）先用原方法访问 Zot；只有已授权、符合策略的可信本地缺失才回退。缓存不能跳过 Zot。Blob `HEAD`、上传、会话、mount、PUT、DELETE 和发现接口仍走 Zot。 |
 | 0002 §3：同名覆盖 | 新 Push 提交后，下一次 Tag 读取优先返回 Zot；按公网旧 digest 读取不转成 Tag 查找。删除本地 Tag 后可再次露出 Mirror 固定版本，不建立屏蔽记录。 |
 | 0002 §1、§4、[0001](../.omp/specs/0001-lazy-mirror.md) §3、§6：回源 | 用 [Distribution reference](https://pkg.go.dev/github.com/distribution/reference#ParseNormalizedNamed) 规范化上游。Docker Hub 补 `library/` 并访问 `registry-1.docker.io`；显式仓库可动态回源，短名需逐个批准。逻辑 Registry 的 deny 优先于 allow；这些规则不代替 realm/CDN 的 TLS 与拨号地址校验。Mirror 用 go-containerregistry 完成匿名 Bearer 握手，不用客户端入站凭据回源。 |
-| 0001 §4：Manifest | 按请求独立获取原始 Manifest，不拉取 config、层或 Index 的子 Manifest。支持 OCI Image Manifest / Image Index 与 Docker schema 2 Manifest / Manifest List。Tag 和 digest 缓存在进程内；缓存的 Tag 不随公网更新而刷新。 |
+| 0001 §4：Manifest | 按请求独立获取原始 Manifest，不拉取 config、层或 Index 的子 Manifest。支持 OCI Image Manifest / Image Index 与 Docker schema 2 Manifest / Manifest List。Tag 和 digest 绑定持久化；已固定的 Tag 不随公网更新而刷新。 |
 | 0002 §5、0001 §2.2：Blob | 一次冷读只按 digest 下载请求的 Blob；同一 Blob 的并发冷读可合并。完整内容经 SHA-256 校验、发布到磁盘后才提供给客户端。冷 `Range` 同样先取并校验整个 Blob，再从本地文件服务 `206` 或 `416`。 |
 
-冷 Manifest 与 Blob 共用 4 个并发回源槽。冷获取的 Manifest 上限为 4 MiB、30 秒，Blob 上限为 2 GiB、10 分钟。重启后磁盘 Blob 仍可复用，但进程内固定的 Tag 及 Manifest 会丢失；固定 Tag 也不等于所有依赖都已离线可读。
+冷获取的 Manifest 上限为 4 MiB、30 秒，Blob 上限为 2 GiB、10 分钟。固定 Tag 不等于所有依赖都已离线可读。
 
-规范化不改变 Zot 仓库、JWT scope 或覆盖 Tag。`alpine`、`library/alpine`、`docker.io/library/alpine` 即使同指一个上游，也各自持有缓存。Blob 目录以原仓库名和规范化来源共同派生，因此旧单仓库 PoC 的缓存文件不会被新布局复用。Tag 省略时由 OCI 客户端请求 `latest`；协议层仍要求有效 Tag 或 SHA-256 digest。
+规范化不改变 Zot 仓库、JWT scope 或覆盖 Tag。缓存同时按下游原仓库名和规范化上游来源隔离；`alpine`、`library/alpine`、`docker.io/library/alpine` 即使同指一个上游，也各自持有缓存。Tag 省略时由 OCI 客户端请求 `latest`；协议层仍要求有效 Tag 或 SHA-256 digest。
 
 改动入口：[`main.go`](../cmd/oci-mirror/main.go) 保留 Zot 转发和回退判断；[`resolver.go`](../cmd/oci-mirror/resolver.go) 负责引用规范化和回退策略；[`upstream.go`](../cmd/oci-mirror/upstream.go) 封装匿名上游与出站策略；[`cache.go`](../cmd/oci-mirror/cache.go) 负责 Manifest 固定、Blob 下载和校验发布。
+
+### 持久缓存与配额
+
+启用回退时，每个 Mirror 进程使用一个专用的本地持久目录，不与其他进程共享。`<cache-dir>/mirror-v1/catalog.sqlite` 使用 SQLite WAL 与 `synchronous=FULL`，记录不可变的原始 Manifest 字节、上游来源与下游仓库、Tag 和 digest 绑定、Blob 描述符长度及已发布的 Blob 记录。`mirror-v1/staging/` 存放下载中的临时文件，`mirror-v1/blobs/` 存放已校验发布的 Blob。
+
+重启恢复固定记录与已发布的 Blob，清理中断的暂存文件及孤立文件，并按调低后的 Blob 配额淘汰载荷，不修剪 Manifest 固定记录。已初始化的缓存丢失目录数据库时启动失败，不会静默创建新库并重新固定 Tag。旧布局在 `mirror-v1/` 旁的缓存文件不会被读取、迁移或删除。
+
+以下参数均须为正数；字节参数传十进制整数：
+
+| 参数 | 默认 | 计量对象 |
+| --- | ---: | --- |
+| `-cache-manifest-bytes` | 64 MiB | 固定的原始 Manifest 字节 |
+| `-cache-manifest-entries` | 10000 | digest 记录与 Tag 绑定合计 |
+| `-cache-blob-bytes` | 16 GiB | 已发布的 Blob 载荷 |
+| `-cache-blob-entries` | 10000 | 已发布的 Blob 记录 |
+| `-cache-staging-bytes` | 8 GiB | 全局 Blob 暂存预留 |
+| `-cache-upstream-staging-bytes` | 4 GiB | 每个逻辑 Registry 的 Blob 暂存预留 |
+| `-cache-fetches` | 4 | 全局并行冷回源请求 |
+| `-cache-upstream-fetches` | 2 | 每个逻辑 Registry 的并行冷回源请求 |
+
+例如，将下列参数加到已配置认证和回退的 Mirror 启动命令，前提是专用目录已由运维人员准备且运行用户可写：
+
+```text
+-cache-dir /var/lib/oci-mirror/cache -cache-blob-bytes 8589934592 -cache-blob-entries 5000
+```
+
+并发槽由冷 Manifest 和冷 Blob 请求共用；每上游配额按逻辑 Registry 计量，Docker Hub 别名共用配额，但不同 Registry 的小请求可在全局额度内并发。Blob 写入暂存前按已知预期长度预留空间，长度未知时按有上限的单对象额度预留。已知长度超出配额或剩余配额不足返回 `507`，冷回源槽用尽返回 `503`，目录中已有发布记录但文件缺失或长度不符返回 `500`。
+
+Manifest 固定记录不淘汰；额度不足时新增绑定返回 `507`。Blob 淘汰采用近似 LRU，跳过正在读取的载荷，最近访问时间按一秒粒度更新。已发布载荷预算不含 SQLite 元数据及 WAL 开销，也不含暂存和旧布局文件；这些参数不是物理磁盘用量的硬上限。需要硬上限时另设文件系统配额，并为目录数据库与 WAL 留出空间。
+
+### 持久缓存实测
+
+在保留的 Zot 和 docker-auth 上，用专用缓存目录触发 `SIGKILL` 后重启，并移除 `r.ltkk.run` 的私网出站例外。相同 Tag、digest、原始 Manifest 字节和 Blob 仍命中，新的冷 Tag 因无法回源返回 `502`。SQLite 中保有原 Manifest 的 Blob 描述符；中断 staging 与无目录记录的 Blob 文件被清理，旧布局文件未触碰。第二个 Mirror 不能同时打开该目录。
+
+缩小配额后，实测 Blob 按字节及条目上限分别淘汰，Manifest 固定记录不受影响；超出 Manifest 或 staging 配额返回 `507`。原已发布 Blob 被截断后返回 `500` 而不重新回源，另一个上游仓库不存在同一 digest 时仍返回 `404`。独立的压力场景也验证了全局/每上游的并发与暂存限制、活动读者不被回收、并发发布只保留同一份 Tag 绑定。
+
+留存的 Mirror 已切换到新版持久缓存；本机 Docker Engine 通过 JWT/TLS 拉取 `registry.k8s.io/pause:3.10`，本机 Skopeo 完整拉取 `r.ltkk.run/library/alpine:latest` 并核对镜像层摘要。Zot、docker-auth 和旧版缓存目录均保留。
 
 ## Smoke：按阶段执行
 
@@ -103,9 +140,11 @@ child_digest=$(jq -er '
   select(length == 1) | .[0].digest
 ' "$scratch/public-root.json")
 
+blob_dir="$scratch/cache/mirror-v1/blobs"
+
 mirror_curl -fsSI -H "Accept: $docker_list" "$mirror$api/manifests/$tag" |
   tr -d '\r' | grep -Fxi "Docker-Content-Digest: $public_digest"
-test -z "$(find "$scratch/cache" -type f -print -quit)"
+test -z "$(find "$blob_dir" -type f -print -quit)"
 
 skopeo inspect --raw --authfile "$scratch/reader.auth.json" --cert-dir "$scratch/trust" \
   "$ref:$tag" >"$scratch/mirror-root.json"
@@ -113,7 +152,7 @@ cmp "$scratch/public-root.json" "$scratch/mirror-root.json"
 test "$(grep -Fc 'mirror manifest published digest=' "$scratch/mirror.log")" -eq 1
 test "$(mirror_curl -sS -o /dev/null -w '%{http_code}' -H "Accept: $oci_manifest" \
   "$mirror$api/manifests/$tag")" = 406
-test -z "$(find "$scratch/cache" -type f -print -quit)"
+test -z "$(find "$blob_dir" -type f -print -quit)"
 
 skopeo inspect --raw --authfile "$scratch/reader.auth.json" --cert-dir "$scratch/trust" \
   "$ref@$child_digest" >"$scratch/public-child.json"
@@ -125,9 +164,9 @@ layer=$(jq -er '.layers[0].digest' "$scratch/public-child.json")
 layer_size=$(jq -er '.layers[0].size | select(. >= 16)' "$scratch/public-child.json")
 old_config=$(jq -er '.config.digest' "$scratch/public-child.json")
 old_config_size=$(jq -er '.config.size | select(. >= 16)' "$scratch/public-child.json")
-test -z "$(find "$scratch/cache" -type f -print -quit)"
+test -z "$(find "$blob_dir" -type f -print -quit)"
 test "$(http_head_code "$mirror$api/blobs/$layer")" = 404
-test -z "$(find "$scratch/cache" -type f -print -quit)"
+test -z "$(find "$blob_dir" -type f -print -quit)"
 zot_http | jq -ce --arg path "$api/blobs/$layer" \
   'select(.method == "HEAD" and .path == $path and .statusCode == 404)'
 ```
@@ -153,7 +192,7 @@ test "$(mirror_curl -fsS --range 0-15 -o "$scratch/cold.range" \
 mirror_curl -fsS "$mirror$api/blobs/$layer" -o "$scratch/layer.blob"
 test "$(sha256_file "$scratch/layer.blob")" = "$layer"
 head -c 16 "$scratch/layer.blob" | cmp - "$scratch/cold.range"
-test "$(find "$scratch/cache" -type f | wc -l)" -eq 1
+test "$(find "$blob_dir" -type f | wc -l)" -eq 1
 test "$(grep -Fc "mirror blob published digest=$layer " "$scratch/mirror.log")" -eq 1
 check_range "$mirror$api/blobs/$layer" "$layer_size" "$scratch/layer.blob"
 test "$(mirror_curl -sS --range "$layer_size-" -o /dev/null -w '%{http_code}' \
@@ -307,7 +346,6 @@ docker run --rm --network "$JWT_NETWORK" --add-host "$JWT_HOST:$JWT_IP" \
 ## 延后项与下一阶段顺序
 
 1. **部署验证。** P0 的信任边界仅涵盖上面限定的专用 Zot 和传统 Registry Bearer JWT，不支持通用 OIDC、权限隐藏型后端、集群或远端同步。对外开放前按实际签发策略和目标版本复核错误 issuer/audience/scope、过期 token、权限隐藏和后端故障均不能触发回退；确认入站凭据不进入公网请求。
-2. **持久化与容量。** 补齐跨重启固定 Tag/Manifest、缓存容量和 GC；此 PoC 只保留经校验的磁盘 Blob，没有缓存淘汰策略。
-   多上游目前共用连接池和全局冷回源槽，尚无每 Registry 的独立速率限制或有界 Bearer token 上下文复用。
+2. **多上游调度。** 现有配额限制全局与每个逻辑 Registry 的并发及暂存；尚无更细的速率策略或有界、可复用的 Bearer 上下文。
 3. **传输优化。** 补齐 0002 §5.1 的完整冷 GET 提前出流、末尾字节保留与响应中止语义，再实现 §5.2 的上游 Range 续传，并以大 Blob、故障注入、读者断开和慢读者场景验证。PoC 不提前发前缀、不续传、不分片。
 4. **上线验收。** 本文的验收只针对宿主机 Docker 与 Skopeo，不代表其它客户端或完整多架构矩阵。若客户端依赖 Blob HEAD `200` 才能 Pull，不能靠伪造成功响应通过验收。

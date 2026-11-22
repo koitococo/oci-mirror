@@ -12,11 +12,9 @@ import (
 	"mime"
 	"net/http"
 	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	registry "github.com/google/go-containerregistry/pkg/v1/remote/transport"
@@ -35,19 +33,15 @@ var (
 		"application/vnd.docker.distribution.manifest.list.v2+json",
 		"application/vnd.docker.distribution.manifest.v2+json",
 	}
-	errBusy = errors.New("all cold fetch slots are in use")
 )
 
 type mirrorCache struct {
-	ctx          context.Context
-	transport    http.RoundTripper
-	dir, staging string
-	slots        chan struct{}
-	blobTasks    singleflight.Group
-
-	mu        sync.Mutex
-	manifests map[cacheKey]*manifest
-	blobSizes map[cacheKey]int64
+	*cacheStorage
+	ctx       context.Context
+	cancel    context.CancelFunc
+	transport http.RoundTripper
+	quota     fetchQuota
+	blobTasks singleflight.Group
 }
 
 type cacheScope struct {
@@ -68,18 +62,26 @@ type manifest struct {
 	body              []byte
 }
 
-func newMirrorCache(ctx context.Context, dir string, transport http.RoundTripper) (*mirrorCache, error) {
-	if err := os.MkdirAll(dir, 0700); err != nil {
+func newMirrorCache(ctx context.Context, dir string, transport http.RoundTripper, limits cacheLimits) (*mirrorCache, error) {
+	if err := limits.validate(); err != nil {
 		return nil, err
 	}
-	staging, err := os.MkdirTemp(dir, ".staging-")
+	store, err := openCacheStorage(ctx, dir, limits)
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithCancel(ctx)
 	return &mirrorCache{
-		ctx: ctx, transport: transport, dir: dir, staging: staging, slots: make(chan struct{}, 4),
-		manifests: make(map[cacheKey]*manifest), blobSizes: make(map[cacheKey]int64),
+		cacheStorage: store,
+		ctx:          ctx, cancel: cancel, transport: transport,
+		quota: fetchQuota{limits: limits, origin: make(map[string]*originUsage)},
 	}, nil
+}
+
+func (c *mirrorCache) close() error {
+	c.cancel()
+	c.quota.close()
+	return c.cacheStorage.close()
 }
 
 func (c *mirrorCache) serve(w http.ResponseWriter, r *http.Request, read readRequest) {
@@ -94,9 +96,11 @@ func (c *mirrorCache) serve(w http.ResponseWriter, r *http.Request, read readReq
 func (c *mirrorCache) serveManifest(w http.ResponseWriter, r *http.Request, repo resolvedRepository, ref string) {
 	key := cacheKey{repositoryScope(repo), ref}
 	accept := r.Header.Values("Accept")
-	c.mu.Lock()
-	m := c.manifests[key]
-	c.mu.Unlock()
+	m, err := c.manifests.get(r.Context(), key)
+	if err != nil {
+		fetchError(w, "manifests", cacheStorageError(err))
+		return
+	}
 	if m == nil {
 		var allowed []string
 		for _, mediaType := range manifestTypes {
@@ -110,7 +114,6 @@ func (c *mirrorCache) serveManifest(w http.ResponseWriter, r *http.Request, repo
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		var err error
 		m, err = c.fetchManifest(ctx, repo, key, allowed)
 		if err != nil {
 			fetchError(w, "manifests", err)
@@ -131,12 +134,11 @@ func (c *mirrorCache) serveManifest(w http.ResponseWriter, r *http.Request, repo
 }
 
 func (c *mirrorCache) fetchManifest(ctx context.Context, repo resolvedRepository, key cacheKey, allowed []string) (*manifest, error) {
-	select {
-	case c.slots <- struct{}{}:
-		defer func() { <-c.slots }()
-	default:
-		return nil, errBusy
+	usage, err := c.quota.acquire(repo.logicalRegistry)
+	if err != nil {
+		return nil, err
 	}
+	defer c.quota.release(repo.logicalRegistry, usage)
 	ref := key.reference
 	source := publicSource{repo: repo.source, transport: c.transport}
 	resp, err := source.get(ctx, "manifests", ref, strings.Join(allowed, ", "))
@@ -173,30 +175,25 @@ func (c *mirrorCache) fetchManifest(ctx context.Context, repo resolvedRepository
 		return nil, errors.New("invalid upstream image manifest")
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if pinned := c.manifests[key]; pinned != nil {
-		return pinned, nil
-	}
-	m := &manifest{mediaType: mediaType, digest: digest, body: body}
-	digestKey := cacheKey{key.cacheScope, digest}
-	if existing := c.manifests[digestKey]; existing != nil {
-		m = existing
-	}
-	c.manifests[digestKey] = m
-	c.manifests[key] = m
-	remember := func(d descriptor) {
-		descriptorKey := cacheKey{key.cacheScope, d.Digest}
-		if _, known := c.blobSizes[descriptorKey]; !known && d.Size != nil && *d.Size >= 0 && digestPattern.MatchString(d.Digest) {
-			c.blobSizes[descriptorKey] = *d.Size
+	refs := make([]blobDescriptor, 0, len(metadata.Layers)+1)
+	add := func(d descriptor) {
+		if d.Size != nil && *d.Size >= 0 && digestPattern.MatchString(d.Digest) {
+			refs = append(refs, blobDescriptor{digest: d.Digest, size: *d.Size})
 		}
 	}
-	remember(metadata.Config)
+	add(metadata.Config)
 	for _, layer := range metadata.Layers {
-		remember(layer)
+		add(layer)
 	}
-	log.Printf("mirror manifest published digest=%s", digest)
-	return m, nil
+	m := &manifest{mediaType: mediaType, digest: digest, body: body}
+	published, err := c.manifests.publish(ctx, key, m, refs)
+	if err != nil {
+		return nil, cacheStorageError(err)
+	}
+	if published == m {
+		log.Printf("mirror manifest published digest=%s", digest)
+	}
+	return published, nil
 }
 
 func accepts(values []string, mediaType string) bool {
@@ -236,14 +233,13 @@ func accepts(values []string, mediaType string) bool {
 }
 
 func (c *mirrorCache) serveBlob(w http.ResponseWriter, r *http.Request, repo resolvedRepository, digest string) {
-	scope := repositoryScope(repo)
-	// Neither repository name can contain a NUL byte.
-	sum := sha256.Sum256([]byte(scope.downstream + "\x00" + scope.source))
-	path := filepath.Join(c.dir, hex.EncodeToString(sum[:]), "blobs", strings.TrimPrefix(digest, "sha256:"))
-	f, err := os.Open(path)
+	key := cacheKey{repositoryScope(repo), digest}
+	defer c.blobs.pin(key)()
+	f, err := c.blobs.open(r.Context(), key)
 	if errors.Is(err, os.ErrNotExist) {
-		task := c.blobTasks.DoChan(path, func() (any, error) {
-			return nil, c.downloadBlob(repo, cacheKey{scope, digest}, path)
+		taskKey := key.downstream + "\x00" + key.source + "\x00" + digest
+		task := c.blobTasks.DoChan(taskKey, func() (any, error) {
+			return nil, c.downloadBlob(repo, key)
 		})
 		select {
 		case <-r.Context().Done():
@@ -254,7 +250,7 @@ func (c *mirrorCache) serveBlob(w http.ResponseWriter, r *http.Request, repo res
 				return
 			}
 		}
-		f, err = os.Open(path)
+		f, err = c.blobs.open(r.Context(), key)
 	}
 	if err != nil {
 		registryError(w, http.StatusInternalServerError, "UNKNOWN", "cannot open verified blob")
@@ -267,61 +263,109 @@ func (c *mirrorCache) serveBlob(w http.ResponseWriter, r *http.Request, repo res
 	http.ServeContent(w, r, digest, time.Time{}, f)
 }
 
-func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, target string) error {
-	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	select {
-	case c.slots <- struct{}{}:
-		defer func() { <-c.slots }()
-	default:
-		return errBusy
-	}
+func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey) error {
 	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Minute)
 	defer cancel()
-	digest := key.reference
+	f, err := c.blobs.open(ctx, key)
+	if err == nil {
+		return cacheStorageError(f.Close())
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return cacheStorageError(err)
+	}
+	usage, err := c.quota.acquire(repo.logicalRegistry)
+	if err != nil {
+		return err
+	}
+	defer c.quota.release(repo.logicalRegistry, usage)
+
+	expected, known, err := c.manifests.blobSize(ctx, key)
+	if err != nil {
+		return cacheStorageError(err)
+	}
 	source := publicSource{repo: repo.source, transport: c.transport}
-	resp, err := source.get(ctx, "blobs", digest, "")
+	resp, err := source.get(ctx, "blobs", key.reference, "")
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
-	c.mu.Lock()
-	expected, known := c.blobSizes[key]
-	c.mu.Unlock()
-	if resp.ContentLength > maxBlobBytes || (known && (expected > maxBlobBytes || (resp.ContentLength >= 0 && expected != resp.ContentLength))) {
-		return errors.New("upstream blob length invalid or above limit")
+	if known && resp.ContentLength >= 0 && expected != resp.ContentLength {
+		return errors.New("upstream blob length does not match the Manifest")
 	}
-	file, err := os.CreateTemp(c.staging, "blob-")
-	if err != nil {
-		return err
+	if !known && resp.ContentLength >= 0 {
+		expected, known = resp.ContentLength, true
 	}
-	defer os.Remove(file.Name())
-	hash := sha256.New()
-	limit := int64(maxBlobBytes)
+	if known && expected > maxBlobBytes {
+		return errors.New("upstream blob length above single-blob limit")
+	}
+	limits := c.quota.limits
+	limit := min(int64(maxBlobBytes), limits.blobBytes, limits.stagingBytes, limits.upstreamStagingBytes)
 	if known {
+		if expected > limit {
+			return errCacheFull
+		}
 		limit = expected
 	}
-	n, copyErr := io.Copy(io.MultiWriter(file, hash), io.LimitReader(resp.Body, limit+1))
-	closeErr := file.Close()
-	if copyErr != nil || closeErr != nil || n > limit || (known && n != expected) || (resp.ContentLength >= 0 && n != resp.ContentLength) {
-		return errors.New("blob staging write failed or downloaded length mismatched")
+	if err := c.quota.reserve(usage, limit); err != nil {
+		return err
 	}
-	if "sha256:"+hex.EncodeToString(hash.Sum(nil)) != digest {
-		return errors.New("upstream blob digest mismatch")
+	defer c.quota.releaseStaging(usage, limit)
+
+	file, err := os.CreateTemp(c.staging, "blob-")
+	if err != nil {
+		return cacheStorageError(err)
+	}
+	defer os.Remove(file.Name())
+	n, err := copyVerifiedBlob(file, resp.Body, key.reference, limit, known)
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if err := errors.Join(syncErr, closeErr); err != nil {
+		return cacheStorageError(err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
-		return err
+	if err := c.blobs.publish(ctx, key, file.Name(), n); err != nil {
+		return cacheStorageError(err)
 	}
-	if err := os.Rename(file.Name(), target); err != nil {
-		return err
-	}
-	log.Printf("mirror blob published digest=%s bytes=%d", digest, n)
+	log.Printf("mirror blob published digest=%s bytes=%d", key.reference, n)
 	return nil
+}
+
+func copyVerifiedBlob(file *os.File, body io.Reader, digest string, limit int64, exact bool) (int64, error) {
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(file, h), io.LimitReader(body, limit))
+	if err != nil {
+		var pathError *os.PathError
+		if errors.As(err, &pathError) {
+			return 0, cacheStorageError(err)
+		}
+		return 0, err
+	}
+	if exact && n != limit {
+		return 0, errors.New("upstream blob shorter than expected")
+	}
+	// Check EOF without writing an extra byte past the staging reservation.
+	if n == limit {
+		var tail [1]byte
+		if _, err := io.ReadFull(body, tail[:]); err != io.EOF {
+			if err != nil {
+				return 0, err
+			}
+			if !exact && limit < maxBlobBytes {
+				return 0, errCacheFull
+			}
+			return 0, errors.New("upstream blob longer than allowed")
+		}
+	}
+	if "sha256:"+hex.EncodeToString(h.Sum(nil)) != digest {
+		return 0, errors.New("upstream blob digest mismatch")
+	}
+	return n, nil
 }
 
 func fetchError(w http.ResponseWriter, kind string, err error) {
@@ -335,7 +379,12 @@ func fetchError(w http.ResponseWriter, kind string, err error) {
 	}
 	switch {
 	case errors.Is(err, errBusy):
-		registryError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "all cold fetch slots are in use")
+		registryError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "global or upstream cold fetch limit reached")
+	case errors.Is(err, errCacheFull):
+		registryError(w, http.StatusInsufficientStorage, "UNAVAILABLE", "Mirror cache quota exhausted")
+	case errors.Is(err, errCacheStorage):
+		log.Printf("mirror cache failed kind=%s: %v", kind, err)
+		registryError(w, http.StatusInternalServerError, "UNKNOWN", "local Mirror cache failed")
 	case errors.Is(err, errPublicURL), errors.Is(err, errPublicIP), errors.Is(err, errPrivateDNS):
 		log.Printf("mirror egress policy rejected kind=%s", kind)
 		registryError(w, http.StatusBadGateway, "UNAVAILABLE", "upstream rejected by egress policy")

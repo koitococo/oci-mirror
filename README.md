@@ -131,7 +131,11 @@ kill -0 "$mirror_pid"
 
 通过下游授权、确认是可信本地缺失后，启用 `-poc-enable-fallback` 且省略 `-poc-public-repo` 即默认允许符合出站策略的显式 Registry，例如 `docker.io/library/alpine` 或 `registry.k8s.io/pause`。`-poc-allow-registry`、`-poc-deny-registry` 都可重复：未设置 allow 列表时不额外限制 Registry；配置 deny 时 deny 始终优先。只开放几个仓库时，重复 `-poc-public-repo` 限定范围；`alpine`、`library/alpine` 等短名必须逐个用该选项批准。不开 `-poc-enable-fallback` 时仅转发 Zot。
 
-规范化只用于回源：Docker Hub 的 API 是 `registry-1.docker.io`，官方镜像补 `library/`；Zot 路径、JWT scope、覆盖 Tag 和缓存仍按客户端原仓库名隔离。上游须支持匿名 HTTPS/443，不能用路径指定端口、IP 或上游凭据。
+规范化只用于确定回源位置：Docker Hub 的 API 是 `registry-1.docker.io`，官方镜像补 `library/`；Zot 路径、JWT scope 和覆盖 Tag 保持客户端原仓库名，缓存同时按原仓库名和规范化来源隔离。上游须支持匿名 HTTPS/443，不能用路径指定端口、IP 或上游凭据。
+
+## 持久缓存
+
+启用回退时，将 `-cache-dir` 指向本机专用持久目录，只交给一个 Mirror 进程使用。重启会恢复固定的 Manifest 和 Tag；Blob 可按容量淘汰，固定 Tag 不保证依赖全部可离线读取。新布局不读取、不迁移也不删除旧缓存文件。[目录布局、配额参数和运维限制](docs/poc.md#持久缓存与配额)。
 
 ## 验收与清理
 

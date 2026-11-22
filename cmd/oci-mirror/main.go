@@ -98,7 +98,8 @@ func run() error {
 	zotConfig := flag.String("zot-config", "", "same immutable JSON config used by a dedicated local-only Zot")
 	jwtIssuer := flag.String("jwt-issuer", "", "expected issuer of the Zot Docker Registry Bearer JWT")
 	enableFallback := flag.Bool("poc-enable-fallback", false, "enable anonymous upstream reads after a trusted local Zot 404")
-	cacheDir := flag.String("cache-dir", "", "directory for verified Mirror blobs (required when fallback is enabled)")
+	cacheDir := flag.String("cache-dir", "", "directory for the persistent Mirror cache (required when fallback is enabled)")
+	limits := cacheLimitFlags()
 	policy := fallbackPolicy{
 		repositories: make(map[string]struct{}),
 		allowed:      make(map[string]struct{}),
@@ -171,11 +172,15 @@ func run() error {
 		if *cacheDir == "" {
 			return errors.New("-cache-dir is required with -poc-enable-fallback")
 		}
-		cache, err = newMirrorCache(ctx, *cacheDir, newPublicTransport(privateDNSHosts))
+		cache, err = newMirrorCache(ctx, *cacheDir, newPublicTransport(privateDNSHosts), *limits)
 		if err != nil {
 			return fmt.Errorf("open cache: %w", err)
 		}
-		defer os.RemoveAll(cache.staging)
+		defer func() {
+			if err := cache.close(); err != nil {
+				log.Printf("close cache: %v", err)
+			}
+		}()
 	}
 
 	server := &http.Server{Addr: *listen, Handler: overlay(zot, policy, cache, auth, transport), ReadHeaderTimeout: 10 * time.Second}
@@ -188,7 +193,11 @@ func run() error {
 	case <-ctx.Done():
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return server.Shutdown(shutdown)
+		if err := server.Shutdown(shutdown); err != nil {
+			_ = server.Close()
+			return err
+		}
+		return nil
 	}
 }
 
