@@ -106,10 +106,12 @@ func (c *mirrorCache) serveManifest(w http.ResponseWriter, r *http.Request, repo
 	accept := r.Header.Values("Accept")
 	m, err := c.manifests.get(r.Context(), key)
 	if err != nil {
+		setRequestCache(r.Context(), "error")
 		manifestRequestFailed(w, r, repo, ref, diagnoseAt("manifest_lookup", cacheStorageError(err)))
 		return
 	}
 	if m == nil {
+		setRequestCache(r.Context(), "miss")
 		var allowed []string
 		for _, mediaType := range manifestTypes {
 			if accepts(accept, mediaType) {
@@ -127,6 +129,8 @@ func (c *mirrorCache) serveManifest(w http.ResponseWriter, r *http.Request, repo
 			manifestRequestFailed(w, r, repo, ref, err)
 			return
 		}
+	} else {
+		setRequestCache(r.Context(), "hit")
 	}
 	if !accepts(accept, m.mediaType) {
 		registryError(w, http.StatusNotAcceptable, "MANIFEST_UNKNOWN", "pinned manifest media type not accepted")
@@ -275,14 +279,17 @@ func (c *mirrorCache) serveBlob(w http.ResponseWriter, r *http.Request, repo res
 	defer c.blobs.pin(key)()
 	f, err := c.blobs.open(r.Context(), key)
 	if err == nil {
+		setRequestCache(r.Context(), "hit")
 		serveVerifiedBlob(w, r, digest, f)
 		return
 	}
 	if !errors.Is(err, os.ErrNotExist) {
+		setRequestCache(r.Context(), "error")
 		blobRequestFailed(r.Context(), key, nil, "published_open", err)
 		registryError(w, http.StatusInternalServerError, "UNKNOWN", "cannot open verified blob")
 		return
 	}
+	setRequestCache(r.Context(), "miss")
 	flight := c.joinBlobFlight(repo, key)
 	if earlyBlobGET(r) {
 		c.serveColdBlob(w, r, key, flight)

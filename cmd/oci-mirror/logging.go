@@ -20,17 +20,26 @@ import (
 
 const requestIDHeader = "X-Request-ID"
 
-type logRequestIDKey struct{}
+type requestLogKey struct{}
+
+type requestLog struct {
+	id    string
+	cache string
+}
 
 func newLogID() string { return rand.Text() }
 
-func withRequestID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, logRequestIDKey{}, id)
+func setRequestCache(ctx context.Context, result string) {
+	if entry, _ := ctx.Value(requestLogKey{}).(*requestLog); entry != nil {
+		entry.cache = result
+	}
 }
 
 func requestID(ctx context.Context) string {
-	id, _ := ctx.Value(logRequestIDKey{}).(string)
-	return id
+	if entry, _ := ctx.Value(requestLogKey{}).(*requestLog); entry != nil {
+		return entry.id
+	}
+	return ""
 }
 
 type diagnosticError struct {

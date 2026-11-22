@@ -120,9 +120,14 @@ func overlay(backend *url.URL, policy fallbackPolicy, cache *mirrorCache, transp
 		},
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := newLogID()
-		w.Header().Set(requestIDHeader, id)
-		proxy.ServeHTTP(w, r.WithContext(withRequestID(r.Context(), id)))
+		entry := requestLog{id: newLogID(), cache: "bypass"}
+		w.Header().Set(requestIDHeader, entry.id)
+		ctx := context.WithValue(r.Context(), requestLogKey{}, &entry)
+		defer func() {
+			slog.InfoContext(ctx, "http_request", "request_id", entry.id,
+				"method", r.Method, "url", r.URL.EscapedPath(), "cache", entry.cache)
+		}()
+		proxy.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

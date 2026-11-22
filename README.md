@@ -183,6 +183,7 @@ Mirror 为每个请求生成 `X-Request-ID`，在响应中返回并传给可信�
 
 | 事件 | 如何解读 |
 | --- | --- |
+| `http_request` | 每个到达 Mirror 的 HTTP 请求完成时记录一条 INFO。包含 `method`、`url`（客户端请求的转义路径，不含查询串）和 `cache`。`hit` 表示首次查到已缓存对象，`miss` 表示首次未查到（包括等待同一次 Blob 下载），`bypass` 表示未查 Mirror 缓存（例如请求由后端直接处理），`error` 表示缓存查询失败。缓存状态不代表 HTTP 请求是否成功。 |
 | `backend_response_failed` / `backend_transport_failed` | 后端返回 `5xx`，或 Mirror 未能完成后端 HTTP 请求。`source` 区分主请求和缺失确认；传输失败记录经过分类的 `reason`，不记录原始错误。 |
 | `backend_fallback_skipped` | 后端 `404` 被原样返回。`reason` 区分 Registry 策略、无法识别的缺失响应和补探测没有确认；有探测时查看 `probe_method`、`probe_status` 或 `error_reason`。 |
 | `manifest_request_failed` | `stage` 区分匿名鉴权初始化、刷新、限速等待、资源请求、正文读取和 Manifest 校验。`response_status` 是客户端收到的状态，与实际 `upstream_status` 分开；例如上游返回 `200` 但 digest 不匹配时，客户端仍收到 `502`。 |
