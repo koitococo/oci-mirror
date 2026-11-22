@@ -7,7 +7,7 @@
  　　　　　　　　　　　└── 获准的本地 miss → Mirror 缓存或匿名 HTTPS 上游
 ```
 
-回源要求公网 HTTPS；本次预检发现 `r.ltkk.run` 的公开 DNS 返回私网地址 `172.16.56.2`，因此不作为示例上游，即使在当前网段能匿名访问。请勿为该源绕过出站限制。
+回源只用 HTTPS/443，始终校验证书。默认拒绝解析到非公网地址的 DNS 主机；需要访问 `r.ltkk.run`（当前 DNS IPv4 为 `172.16.56.2`）时，显式配置 `-poc-private-dns-host r.ltkk.run`。该选项可重复，只匹配每次请求实际使用的主机名，不匹配父域或通配符；Registry、Bearer realm 和重定向目标分别检查。仅放行 DNS 返回的 RFC 1918 / IPv6 ULA 地址，私网 IP 字面量、回环和链路本地地址仍拒绝。这是本机 PoC 对 0001 §7 的显式例外，不是生产出口策略。
 
 Zot 是本地仓库和上传会话的唯一权威，不配置认证、访问控制或 `sync`，也不共享 Mirror 的缓存。该隔离部署让 Mirror 可以把 Zot 的 `404` 视为本地缺失；这不是生产中的授权规则。
 
@@ -196,7 +196,9 @@ test "$(curl -sS -o /dev/null -w '%{http_code}' "$mirror$api/manifests/$tag")" =
 
 ## 本轮实测
 
-Zot v2.1.15、Skopeo v1.22.0 上，以上五个阶段全部通过。公网根清单为 `sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a`，同名 Zot 覆盖为 `sha256:63881a70fa9f26ae2feb4987058dd5a0b1fb93f823b5d3d1e96a4103724aadec`；删除后字节级恢复公网根清单。另在专用本机实例确认 `r.ltkk.run` 的冷回源被出站策略拒绝。
+Zot v2.1.15、Skopeo v1.22.0 上，以上五个阶段全部通过。公网根清单为 `sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a`，同名 Zot 覆盖为 `sha256:63881a70fa9f26ae2feb4987058dd5a0b1fb93f823b5d3d1e96a4103724aadec`；删除后字节级恢复公网根清单。
+
+私网 DNS 例外单独验收：未配置 allowlist 或只列 `ltkk.run` 时 `r.ltkk.run` 的冷读返回 `502`；列精确主机 `r.ltkk.run` 后通过 Skopeo 完整匿名拉取 `library/alpine:latest`，Manifest 原始字节和层 SHA-256 均与上游一致。直接配置 `172.16.56.2` 为仓库主机或 allowlist 项都被拒绝。
 
 ## 延后项与下一阶段顺序
 

@@ -62,49 +62,74 @@ func (e *upstreamStatus) Error() string { return fmt.Sprintf("upstream HTTP %d",
 
 var dnsPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
 
-func dnsHost(host string) bool {
-	_, ipErr := netip.ParseAddr(host)
-	return ipErr != nil && len(host) <= 253 && dnsPattern.MatchString(strings.ToLower(host))
+func checkUpstreamHost(host string) error {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if ip.Zone() != "" || !publicIP(ip.Unmap()) {
+			return errPublicIP
+		}
+		return nil
+	}
+	if len(host) > 253 || !dnsPattern.MatchString(strings.ToLower(host)) {
+		return errPublicURL
+	}
+	return nil
 }
 
 type publicTransport struct{ transport *http.Transport }
 
 var (
-	errPublicURL = errors.New("upstream URL must use public DNS and HTTPS/443")
-	errPublicIP  = errors.New("upstream DNS includes a non-public target")
+	errPublicURL  = errors.New("upstream URL must use HTTPS/443 with a DNS hostname or IP address")
+	errPublicIP   = errors.New("upstream URL must not use a non-public IP literal")
+	errPrivateDNS = errors.New("upstream DNS returned an address outside the egress policy")
 )
 
 func (p publicTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	u := req.URL
-	if u.Scheme != "https" || u.User != nil || !dnsHost(u.Hostname()) || (u.Port() != "" && u.Port() != "443") {
+	if u.Scheme != "https" || u.User != nil || (u.Port() != "" && u.Port() != "443") {
 		return nil, errPublicURL
+	}
+	if err := checkUpstreamHost(u.Hostname()); err != nil {
+		return nil, err
 	}
 	return p.transport.RoundTrip(req)
 }
 
-func newPublicTransport() http.RoundTripper {
-	dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+func newPublicTransport(privateDNSHosts map[string]struct{}) http.RoundTripper {
+	dialer := net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+		// Resolve hostnames without libc interpreting noncanonical numeric names as IPs.
+		Resolver: &net.Resolver{PreferGo: true},
+	}
 	base := http.DefaultTransport.(*http.Transport).Clone()
 	base.Proxy = nil
 	base.DisableCompression = true
 	base.ResponseHeaderTimeout = 15 * time.Second
 	base.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(address)
-		if err != nil || port != "443" || !dnsHost(host) {
-			return nil, errors.New("invalid upstream dial target")
+		if err != nil || port != "443" {
+			return nil, errPublicURL
 		}
-		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host+".")
+		if err := checkUpstreamHost(host); err != nil {
+			return nil, err
+		}
+		if _, err := netip.ParseAddr(host); err == nil {
+			return dialer.DialContext(ctx, network, address)
+		}
+		ips, err := dialer.Resolver.LookupNetIP(ctx, "ip", host+".")
 		if err != nil {
 			return nil, err
 		}
+		_, privateAllowed := privateDNSHosts[strings.ToLower(host)]
 		for _, ip := range ips {
-			if !publicIP(ip.Unmap()) {
-				return nil, errPublicIP
+			ip = ip.Unmap()
+			if !publicIP(ip) && !(privateAllowed && ip.IsPrivate()) {
+				return nil, errPrivateDNS
 			}
 		}
-		var dialErr error = errors.New("upstream DNS returned no addresses")
+		dialErr := errors.New("upstream DNS returned no addresses")
 		for _, ip := range ips {
-			// Dial the exact checked address; TLS still verifies the URL host.
+			// Dial the checked address; TLS still verifies the original URL hostname.
 			conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
 			if err == nil {
 				return conn, nil

@@ -57,8 +57,12 @@ kill -0 "$mirror_pid"
 
 该固定版本的 [Zot 发布配置](https://github.com/project-zot/zot/blob/v2.1.15/build/stacker.yaml) 默认执行 `serve /etc/zot/config.json`，镜像名见 [发布工作流](https://github.com/project-zot/zot/blob/v2.1.15/.github/workflows/publish.yaml)。上面的挂载让配置文件只读；`:Z` 仅重新标记临时副本，便于在启用 SELinux 的主机上使用。Zot 的 `/var/lib/registry` 留在容器可写层，不与 Mirror 缓存或现有数据卷共用。
 
+本机能访问 `r.ltkk.run` 时，也可把 `repo`、`tag` 改为 `r.ltkk.run/library/alpine`、`latest`，并在 Mirror 启动命令加 `-poc-private-dns-host r.ltkk.run`。该域名解析到私网，未列入 allowlist 时不会回源。此替代源是单平台镜像，不适用下文针对 `pause` 多架构清单的验收步骤。
+
 ## 验收与清理
 
 保持在同一个子 shell，按 [PoC 架构与 smoke 步骤](docs/poc.md) 顺序操作。该流程先读 Manifest、按需缓存公网层，随后从本地目录向同名引用 Push，最后验证覆盖、旧 digest 和删除后回退。预期结果不等于实测报告。
+
+规格完工状态与上线门槛见 [spec 0002 Checklist](docs/spec-0002-checklist.md)。
 
 结束时在子 shell 执行 `exit`。清理会停止这次的 Mirror 和 Zot、删除临时缓存和文件；`--rm` 会随容器退出移除 Zot 容器及其可写层。保留 Docker 镜像，不删除其他镜像、容器或卷。

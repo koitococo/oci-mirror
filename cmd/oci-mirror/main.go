@@ -87,8 +87,19 @@ func overlay(zot *url.URL, repo string, cache *mirrorCache) http.Handler {
 func run() error {
 	listen := flag.String("listen", "127.0.0.1:15000", "loopback listen address")
 	zotURL := flag.String("poc-zot", "", "direct loopback Zot HTTP origin with no auth/accessControl/Sync (required)")
-	publicRepo := flag.String("poc-public-repo", "", "one exact public host/repository eligible for fallback (empty disables fallback)")
+	publicRepo := flag.String("poc-public-repo", "", "one exact host/repository eligible for anonymous fallback (empty disables fallback)")
 	cacheDir := flag.String("cache-dir", "", "directory for verified Mirror blobs (required when fallback is enabled)")
+	privateDNSHosts := make(map[string]struct{})
+	flag.Func("poc-private-dns-host", "exact DNS hostname allowed to resolve to RFC 1918 or IPv6 ULA addresses (repeatable)", func(host string) error {
+		if _, err := netip.ParseAddr(host); err == nil {
+			return errors.New("must name a DNS host, not an IP literal")
+		}
+		if err := checkUpstreamHost(host); err != nil {
+			return err
+		}
+		privateDNSHosts[strings.ToLower(host)] = struct{}{}
+		return nil
+	})
 	flag.Parse()
 
 	if addr, err := netip.ParseAddrPort(*listen); err != nil || !addr.Addr().IsLoopback() {
@@ -112,13 +123,16 @@ func run() error {
 	if *publicRepo != "" {
 		host, _, ok := strings.Cut(*publicRepo, "/")
 		repo, err := name.NewRepository(*publicRepo, name.StrictValidation)
-		if !ok || !dnsHost(host) || err != nil || repo.Name() != *publicRepo {
-			return errors.New("-poc-public-repo must be a canonical public DNS host/repository without port or tag")
+		if !ok || err != nil || repo.Name() != *publicRepo {
+			return errors.New("-poc-public-repo must be a canonical host/repository without port or tag")
+		}
+		if err := checkUpstreamHost(host); err != nil {
+			return fmt.Errorf("-poc-public-repo: %w", err)
 		}
 		if *cacheDir == "" {
 			return errors.New("-cache-dir is required with -poc-public-repo")
 		}
-		cache, err = newMirrorCache(ctx, *cacheDir, publicSource{repo: repo, transport: newPublicTransport()})
+		cache, err = newMirrorCache(ctx, *cacheDir, publicSource{repo: repo, transport: newPublicTransport(privateDNSHosts)})
 		if err != nil {
 			return fmt.Errorf("open cache: %w", err)
 		}

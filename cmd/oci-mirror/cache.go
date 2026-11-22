@@ -315,9 +315,9 @@ func fetchError(w http.ResponseWriter, kind string, err error) {
 	switch {
 	case errors.Is(err, errBusy):
 		registryError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "all cold fetch slots are in use")
-	case errors.Is(err, errPublicURL), errors.Is(err, errPublicIP):
+	case errors.Is(err, errPublicURL), errors.Is(err, errPublicIP), errors.Is(err, errPrivateDNS):
 		log.Printf("mirror egress policy rejected kind=%s", kind)
-		registryError(w, http.StatusBadGateway, "UNAVAILABLE", "upstream rejected by public egress policy")
+		registryError(w, http.StatusBadGateway, "UNAVAILABLE", "upstream rejected by egress policy")
 	case status == http.StatusNotFound:
 		code := "MANIFEST_UNKNOWN"
 		if kind == "blobs" {
