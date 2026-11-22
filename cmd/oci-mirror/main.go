@@ -32,11 +32,17 @@ type zotMiss struct{ read readRequest }
 
 func (*zotMiss) Error() string { return "dedicated Zot reported a local miss" }
 
-func overlay(zot *url.URL, policy fallbackPolicy, cache *mirrorCache) http.Handler {
+type claimsKey struct{}
+
+func newZotTransport() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	transport.ResponseHeaderTimeout = 30 * time.Second
-	return &httputil.ReverseProxy{
+	return transport
+}
+
+func overlay(zot *url.URL, policy fallbackPolicy, cache *mirrorCache, auth *bearerAuth, transport *http.Transport) http.Handler {
+	proxy := &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(zot)
@@ -45,12 +51,16 @@ func overlay(zot *url.URL, policy fallbackPolicy, cache *mirrorCache) http.Handl
 			r.SetXForwarded()
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			// -poc-zot opts into this contract: the dedicated, direct Zot has
-			// no Sync, auth policy or middleware that hides denials as 404.
-			if cache != nil && resp.StatusCode == http.StatusNotFound {
-				if read, ok := policy.classify(resp.Request); ok {
-					return &zotMiss{read}
-				}
+			if cache == nil || resp.StatusCode != http.StatusNotFound {
+				return nil
+			}
+			claims, ok := resp.Request.Context().Value(claimsKey{}).(*registryClaims)
+			if !ok {
+				return nil
+			}
+			if read, ok := policy.classify(resp.Request); ok &&
+				claims.canPull(read.repository.downstream) && trustedZotMiss(resp, read, transport) {
+				return &zotMiss{read}
 			}
 			return nil
 		},
@@ -64,11 +74,29 @@ func overlay(zot *url.URL, policy fallbackPolicy, cache *mirrorCache) http.Handl
 			registryError(w, http.StatusBadGateway, "UNAVAILABLE", "Zot transport failed")
 		},
 	}
+	if auth == nil {
+		return proxy
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.URL.Path == "/v2" || strings.HasPrefix(r.URL.Path, "/v2/")) && r.Method != http.MethodOptions {
+			claims, err := auth.authenticate(r)
+			if err != nil {
+				auth.writeChallenge(w, r)
+				return
+			}
+			if cache != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+				r = r.WithContext(context.WithValue(r.Context(), claimsKey{}, claims))
+			}
+		}
+		proxy.ServeHTTP(w, r)
+	})
 }
 
 func run() error {
 	listen := flag.String("listen", "127.0.0.1:15000", "loopback listen address")
 	zotURL := flag.String("poc-zot", "", "direct loopback local-only Zot HTTP origin (required)")
+	zotConfig := flag.String("zot-config", "", "same immutable JSON config used by a dedicated local-only Zot")
+	jwtIssuer := flag.String("jwt-issuer", "", "expected issuer of the Zot Docker Registry Bearer JWT")
 	enableFallback := flag.Bool("poc-enable-fallback", false, "enable anonymous upstream reads after a trusted local Zot 404")
 	cacheDir := flag.String("cache-dir", "", "directory for verified Mirror blobs (required when fallback is enabled)")
 	policy := fallbackPolicy{
@@ -115,11 +143,31 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if (*zotConfig == "") != (*jwtIssuer == "") {
+		return errors.New("-zot-config and -jwt-issuer must be supplied together")
+	}
+	transport := newZotTransport()
+	var auth *bearerAuth
+	if *zotConfig != "" {
+		auth, err = loadZotAuth(*zotConfig, *jwtIssuer)
+		if err != nil {
+			return err
+		}
+		probe, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err = verifyZot(probe, zot, auth, transport)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
 	var cache *mirrorCache
 	if !*enableFallback && (len(policy.repositories)+len(policy.allowed)+len(policy.denied)+len(privateDNSHosts) != 0) {
 		return errors.New("upstream policy options require -poc-enable-fallback")
 	}
 	if *enableFallback {
+		if auth == nil {
+			return errors.New("-poc-enable-fallback requires -zot-config and -jwt-issuer")
+		}
 		if *cacheDir == "" {
 			return errors.New("-cache-dir is required with -poc-enable-fallback")
 		}
@@ -130,7 +178,7 @@ func run() error {
 		defer os.RemoveAll(cache.staging)
 	}
 
-	server := &http.Server{Addr: *listen, Handler: overlay(zot, policy, cache), ReadHeaderTimeout: 10 * time.Second}
+	server := &http.Server{Addr: *listen, Handler: overlay(zot, policy, cache, auth, transport), ReadHeaderTimeout: 10 * time.Second}
 	done := make(chan error, 1)
 	go func() { done <- server.ListenAndServe() }()
 	log.Printf("mirror listen=%s zot=%s upstream_fallback=%t", *listen, zot.Host, *enableFallback)
