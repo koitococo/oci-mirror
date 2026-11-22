@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -126,8 +127,34 @@ func backendTypedMiss(resp *http.Response, read readRequest) backendMissKind {
 	}
 	rawDetail := entry["detail"]
 	repo, ref := read.repository.downstream, read.reference
-	if code == "BLOB_UNKNOWN" && read.kind == "blobs" && backendStringMatches(rawDetail, ref) {
-		return exactBackendMiss // Distribution emits the digest as a JSON string.
+	if len(rawDetail) != 0 && rawDetail[0] == '"' {
+		// Distribution 3.1.2 serializes error details as strings. Match
+		// only its missing-resource formats, not negotiation failures.
+		var detail string
+		if json.Unmarshal(rawDetail, &detail) != nil {
+			return notBackendMiss
+		}
+		switch {
+		case code == "NAME_UNKNOWN":
+			if name, ok := strings.CutPrefix(detail, "unknown repository name="); ok && name == repo {
+				return exactBackendMiss
+			}
+		case code == "MANIFEST_UNKNOWN" && read.kind == "manifests":
+			if tag, ok := strings.CutPrefix(detail, "unknown tag="); ok && tag == ref && tagPattern.MatchString(ref) {
+				return exactBackendMiss
+			}
+			if revision, ok := strings.CutPrefix(detail, "unknown manifest name="); ok {
+				name, digest, ok := strings.Cut(revision, " revision=")
+				if ok && name == repo && digest == ref && digestPattern.MatchString(ref) {
+					return exactBackendMiss
+				}
+			}
+		case code == "BLOB_UNKNOWN" && read.kind == "blobs":
+			if detail == ref {
+				return exactBackendMiss
+			}
+		}
+		return notBackendMiss
 	}
 	detail := backendJSONObject(rawDetail)
 	switch {

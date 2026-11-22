@@ -10,6 +10,8 @@
 
 后端是本地存储和写入的权威：须先执行具体资源的鉴权再查找，不得把拒绝或故障伪装成类型化缺失。使用本地优先语义时，不能启用后端自身的代理缓存（如 Distribution proxy 或 Zot Sync）。Mirror 不用缓存代替后端上传检查，也不重写 `Location`；Distribution 应配置 `http.relativeurls: true` 或将 `http.host` 指向客户端可达的公开入口。
 
+Distribution 2.8.3 与 3.1.2 均已实测公网回退。Mirror 兼容 v2 的对象和 v3 的字符串缺失详情，但只在详情与请求资源精确匹配时回退。
+
 ## 本机启动
 
 下例在可信 Linux amd64 主机上新建临时环境。需要 rootful Docker（使用 host 网络）、Go 1.25+、`curl`、`jq`、`openssl`、`htpasswd` 和 Skopeo。预先为 `mirror-poc.test` 配置解析到 `127.0.0.1`，准备对此名称有效的 TLS 证书及私钥，并让宿主机 Docker daemon 信任其 CA（例如该 Registry 的 `/etc/docker/certs.d/mirror-poc.test:15443/ca.crt`）。设置 `POC_TLS_CERT`、`POC_TLS_KEY`、`POC_TLS_CA` 为对应文件的绝对路径；不要关闭 TLS 校验。TLS 证书与下面生成的 JWT 签名证书是两套不同材料。确认 `15443`、`15000`、`15001`、`15002` 空闲，并可匿名访问 `registry.k8s.io` 的 HTTPS 上游。在仓库根目录进入专用 `bash` 子 shell，执行：
@@ -156,7 +158,5 @@ kill -0 "$mirror_pid"
 ## 验收与清理
 
 保持在同一个子 shell，按 [PoC 架构与 smoke 步骤](docs/poc.md) 顺序操作。该流程先读 Manifest、按需缓存公网层，随后从本地目录向同名引用 Push，最后验证覆盖、旧 digest 和删除后回退。预期结果不等于实测报告。
-
-规格完工状态与上线门槛见 [spec 0002 Checklist](docs/spec-0002-checklist.md)。
 
 结束时在子 shell 执行 `exit`。清理仅停止这次创建的 Mirror、Zot、docker-auth 和 Nginx，删除临时缓存、账号资料和本次 Zot 容器的可写层，不改宿主机解析/信任配置或留存的 JWT fixture。

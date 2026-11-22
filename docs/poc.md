@@ -109,6 +109,19 @@ Manifest 固定记录不淘汰；额度不足时新增绑定返回 `507`。Blob 
 
 Skopeo 在 Distribution Basic 入口直接拉取短名 `alpine:3.22` 并完成镜像复制；显式上游 `registry.k8s.io/pause:3.9` 的 GET/HEAD 也通过。新版另经 Zot 2.1.23 复测 RustFS：完整 Blob GET 的签名 `307 Location` 原样透传，可直接下载并校验；Range 仍由 Zot 返回 `206`。Zot 的 Bearer 测试覆盖 scope，不代表其 issuer 或 audience 校验通过。
 
+### 发现与管理路由验收
+
+Zot 2.1.23、Distribution 2.8.3 和 Distribution 3.1.2 各跑 31 组直连与经 Mirror 请求。HTTP 状态、响应体字节和所比较的 `Link`、`WWW-Authenticate`、`OCI-Filters-Applied`、CORS 等头一致。连接跟踪未发现非后端 IPv4/IPv6 拨号，四张缓存表保持为空；Zot 和 Distribution 2.8.3 随后的公网冷 Manifest 对照请求确实触发回源并写入缓存。
+
+| 路由 | 实际后端行为（Mirror 透传） |
+| --- | --- |
+| `tags/list` | Zot 和 Distribution 3.1.2 按查询分页；2.8.3 在本次请求中返回两个 Tag。未在本地登记的公网同名仓库返回本地 `404`，不拼接公网标签。 |
+| `/v2/_catalog` | 三个后端均验证分页、末页和 Basic 鉴权挑战。 |
+| `/v2/<name>/referrers/<digest>` | Zot 返回真实 OCI referrer，`artifactType` 精确筛选并保留 `OCI-Filters-Applied`。两版 stock Distribution 不提供该路由，原样返回 `404`；v3 的附件 Manifest 本身可写可读。 |
+| `/v2/_zot/ext/mgmt` | Zot 的只读配置返回、错误凭据 `401`、查询和子路径行为均与直连一致；未将 Zot 允许匿名读取的配置误判为 Mirror 授权。Distribution 返回 `404`。 |
+
+**Distribution 3.1.2 回退验收：** 该版本把缺失 Tag 和 Manifest digest 详情编码为字符串，例如 `unknown tag=3.22`、`unknown manifest name=alpine revision=sha256:…`；Mirror 与原始 Tag 或仓库及 digest 精确匹配。实测向独立空缓存分别发送 `alpine:3.22` 的 HEAD 和 GET，均获得相同的公网 Index；另用空缓存通过 Skopeo 完整复制 linux/amd64 镜像，核对子 Manifest、config、layer 的 SHA-256 和大小。匿名或错误 Basic 凭据仍收到后端 `401`，热 Blob HEAD 仍为 `404`，本地同名覆盖优先。实际 OCI Manifest 媒体类型协商失败的 `404` 原样透传，不触发回退。
+
 ### 历史认证、复用与 S3 验收
 
 - **Basic：** 实际 Zot v2.1.15 使用两个 htpasswd 账号验证 `registry.k8s.io/pause:3.10`。有 `read` 权限的账号在空缓存和热缓存都得到 `200`，直接 Zot 返回 `404 NAME_UNKNOWN`；未登录和密码错误均为 `401`，有效账号没有仓库 `read` 权限时冷、热均为 `403`。Skopeo 复制了 linux/amd64 镜像，Manifest、config 和 layer 均核对摘要。Blob `GET` 成功，冷、热 Blob `HEAD` 仍与 Zot 一样返回 `404`。
@@ -137,6 +150,29 @@ Skopeo 在 Distribution Basic 入口直接拉取短名 `alpine:3.22` 并完成�
 | Podman 5.8.10 | `3.10.1` | `e5b941ef8f71de54dc3a13398226c269ba217d06650a21bd3afcf9d890cf1f41` |
 
 三者均无 Blob HEAD，Blob HEAD 只查 Zot 没有阻断本轮冷拉。ctr 用 `--local --platform linux/amd64 --skip-metadata`；不跳过非目标平台元数据时，原配额下出现 `503`。nerdctl 用 `--platform linux/amd64 --unpack=false` 且核对了本地 content store 中 config 与层的摘要；隔离 daemon 上的 snapshot 解包遇到 `no unpack platforms defined`，未宣称解包或运行容器通过。没有为每种客户端重跑 Push/同名覆盖矩阵。
+
+### Linux 平台与同名覆盖验收
+
+使用 `d48df0e333` 构建的 Mirror 和公网 `registry.k8s.io/pause:3.10.1`。该 Index 的 Linux 子项为 `amd64`、`arm/v7`、`arm64`、`ppc64le` 和 `s390x`。按平台拉取并核对 OCI 子 Manifest 和 config，不执行异架构二进制；该 Index 的两个 Windows 子项不在本次 Linux 验收范围。
+
+| 客户端 | 公网拉取 | 同名覆盖 |
+| --- | --- | --- |
+| Docker Engine 28.5.2 | 独立 vfs 存储，`pull --platform` 拉取并解包全部五个 Linux 子项 | Docker 自己 Push `linux/amd64`；下一次 Pull 获得覆盖版。覆盖期间可拉旧 amd64/arm64 digest；经 Mirror 删除覆盖后，Tag 恢复公网版本。 |
+| Podman 5.8.10 | 独立 vfs 存储，`pull --policy always --platform` 拉取并解包全部五个 Linux 子项 | Podman 自己 Push `linux/amd64`，验证同样的覆盖、旧 digest 和删除恢复闭环。 |
+| ctr / containerd 2.1.9 | 独立 daemon，`--local --snapshotter native --skip-metadata`，核对全部五个 Linux 子项及 committed snapshot | ctr 自己以 `pause:3.9` 的对应平台版本覆盖 `3.10.1`；五个平台逐一验收即时覆盖、旧 digest 和删除恢复。 |
+| nerdctl 2.3.4 / containerd 2.1.9 | `--snapshotter native --unpack=true --platform`，核对全部五个 Linux 子项及 committed snapshot | nerdctl 自己 Push，五个平台逐一验收同样的闭环。 |
+
+Docker 和 Podman 各自使用独立 Distribution 2.8.3、空 Mirror 缓存和受信任的临时 TLS CA；读写客户端存储分离，确保覆盖后的第一次 Pull 真实下载新层。
+
+ctr 和 nerdctl 各自使用独立 containerd、Distribution 2.8.3、私有回环 HTTP 和空 Mirror 缓存；每个阶段换 containerd namespace。将下列条目配置到 nerdctl 使用的 daemon，解决了此前隔离环境的 `no unpack platforms defined`；验收检查的是实际 committed snapshot，不是仅下载内容。
+
+```toml
+[[plugins.'io.containerd.transfer.v1.local'.unpack_config]]
+  platform = "linux/amd64"
+  snapshotter = "native"
+```
+
+nerdctl 选择非本机平台时，镜像大小报告可能提示本机 amd64 子项未下载；该提示未影响 Pull 退出状态、所选平台的完整摘要或 snapshot 验证。
 
 ## Smoke：按阶段执行
 
