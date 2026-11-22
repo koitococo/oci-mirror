@@ -12,50 +12,38 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
-	registry "github.com/google/go-containerregistry/pkg/v1/remote/transport"
 )
 
-type publicSource struct {
-	repo      name.Repository
-	transport http.RoundTripper
+func upstreamRedirect(next *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("too many upstream redirects")
+	}
+	if !strings.EqualFold(next.URL.Host, via[0].URL.Host) {
+		next.Header.Del("Authorization")
+	}
+	next.Header.Del("Referer")
+	return nil
 }
 
-// get opens the initial response and returns its scoped client so a Blob
-// download can resume without another authentication handshake.
-func (s publicSource) get(ctx context.Context, kind, ref, accept string) (*http.Response, *http.Client, error) {
-	transport, err := registry.NewWithContext(ctx, s.repo.Registry, authn.Anonymous, s.transport, []string{s.repo.Scope("pull")})
-	if err != nil {
-		return nil, nil, err
-	}
-	client := http.Client{Transport: transport, CheckRedirect: func(next *http.Request, via []*http.Request) error {
-		if len(via) >= 10 {
-			return errors.New("too many upstream redirects")
-		}
-		if !strings.EqualFold(next.URL.Host, via[0].URL.Host) {
-			next.Header.Del("Authorization")
-		}
-		next.Header.Del("Referer")
-		return nil
-	}}
-	u := url.URL{Scheme: "https", Host: s.repo.RegistryStr(), Path: "/v2/" + s.repo.RepositoryStr() + "/" + kind + "/" + ref}
+func getUpstream(ctx context.Context, client *http.Client, repo name.Repository, kind, ref, accept string) (*http.Response, error) {
+	u := url.URL{Scheme: "https", Host: repo.RegistryStr(), Path: "/v2/" + repo.RepositoryStr() + "/" + kind + "/" + ref}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, nil, &upstreamStatus{resp.StatusCode}
+		return nil, &upstreamStatus{resp.StatusCode}
 	}
-	return resp, &client, nil
+	return resp, nil
 }
 
 type upstreamStatus struct{ status int }

@@ -9,7 +9,10 @@
 
 ### 下游认证与可信本地缺失
 
-启用回退必须设置 `-zot-config` 和 `-jwt-issuer`；后者等于 docker-auth 的 `token.issuer`。将同一份不可变 JSON 和同一份 JWT 签名公钥证书只读提供给 Zot 和 Mirror；JSON 中 `http.auth.bearer.cert` 必须是两端均可读的同一绝对路径。Zot 只允许传统 `http.auth.bearer`，不得启用其他认证（包括 OIDC）、`http.accessControl`、集群或远端同步（`extensions.sync`）。不热更新配置；修改后协调重启两端。Mirror 从 `http.auth.bearer.service` 取预期 `aud`、从 `realm` 取挑战端点，并在启动时确认直连 Zot `/v2/` 返回匹配的未限定 scope 的 Bearer challenge。这不是运行时配置或版本证明：信任依赖于操作者确实部署同一配置、保持 Mirror→Zot 的私有直连回环（无中间代理），并使用约定的 Zot v2.1.15 行为。升级 Zot 要重新验证真实缺失和错误响应语义。
+启用回退必须设置 `-zot-config`，将同一份不可变 JSON 只读提供给 Zot 和 Mirror。专用 Zot 只能选择以下一种认证；不支持 OIDC、混合认证、集群或远端同步（`extensions.sync`）。不热更新配置；修改后协调重启两端。启动时 Mirror 直连 Zot `/v2/` 确认返回本模式的无凭据 `401` 挑战。这个探测不是配置或版本证明：操作者仍必须部署同一份配置、保证 Mirror→Zot 私有直连回环且无中间代理，并在升级 Zot 后重新验证授权及可信缺失语义。
+
+- **HTTP Basic：** 仅配置 `http.auth.htpasswd.path`（绝对路径），不传 `-jwt-issuer`。Mirror 不读取密码文件；Zot 验证密码，并按配置执行可选 `http.accessControl` 的原仓库读取 ACL。只有带一份语法有效的 Basic 凭据、且通过 Zot 鉴权得到可信缺失的读请求才能回退。Basic 模式移除 Zot UI 会话 Cookie 和会话请求头；不能用 UI 会话替代 Registry Basic。客户端到入口应使用 HTTPS。
+- **传统 Bearer JWT：** 配置 `http.auth.bearer`，不配置 `http.accessControl`；`-jwt-issuer` 等于 docker-auth 的 `token.issuer`。`http.auth.bearer.cert` 使用两端都能读取的同一绝对路径，提供同一份签名公钥证书；`service` 和 `realm` 分别确定预期 `aud` 和挑战端点。
 
 Mirror 验证 Registry Bearer JWT 的 RSA RS256 签名、`iss`、`aud`、`exp`、可选 `nbf` / `iat` 及非空 `sub`。Zot 仍负责仓库和操作权限及写入。回退还要求 token 对**下游原始仓库名**具有 `pull` scope。参考 [docker-auth ACL](https://github.com/cesanta/docker_auth/blob/1.14.0/examples/reference.yml)，在专用 writer、拒绝和私有仓库规则之后，对已认证账号与带 Registry 域名的仓库发布默认 `pull` scope，见 [README](../README.md#本机启动)。普通本地短名不继承这条默认授权；显式仓库的本地同名覆盖和上游共享同一仓库 ACL。
 
@@ -18,6 +21,15 @@ Mirror 验证 Registry Bearer JWT 的 RSA RS256 签名、`iss`、`aud`、`exp`�
 ### 匿名上游与出站策略
 
 通过下游授权并确认可信缺失后，默认允许符合出站规则的显式 Registry；可选 allow 列表缩小范围，deny 始终优先；短名仍须逐个启用。回源只用匿名 HTTPS/443，以系统 CA 校验证书，并校验实际拨号地址。默认拒绝解析到非公网地址的主机。仅在受控私有部署且使用受管理 DNS 时，操作者才应按确切 FQDN 显式配置 `-poc-private-dns-host`（例如 `r.ltkk.run`）。可重复配置；不匹配父域或通配符，Registry、Bearer realm 和重定向目标分别检查。此例外只允许相应 DNS 返回的 RFC 1918 / IPv6 ULA 地址，不允许直接使用私网 IP 字面量，也不放行回环、链路本地或元数据目的地。是否加入名单是独立于公开 DNS 或证书签发的管理决策；有效证书不能代替出站授权。
+
+匿名 Registry 请求复用同一 HTTP Transport 和连接池。鉴权上下文以 Registry API 主机与规范化仓库的 `pull` scope 为键，不跨仓库共享 token；下游身份、缓存归属和 Zot 路由继续使用原始仓库名。一个上游 Registry 的令牌桶计量注册表探测、令牌请求及重定向后的 CDN 请求；缓存命中不消耗出站额度。
+
+| 参数 | 默认 | 含义 |
+| --- | --- | --- |
+| `-upstream-registries` | 128 | 进程内最多跟踪的上游 Registry 数 |
+| `-upstream-scopes-per-registry` | 64 | 单一 Registry 最多复用的仓库 pull scope 数 |
+| `-upstream-requests-per-second` | 16 | 每个 Registry 的出站 HTTP 令牌补充速率 |
+| `-upstream-request-burst` | 16 | 每个 Registry 的出站 HTTP 突发额度 |
 
 | 规格 | PoC 的行为 |
 | --- | --- |
@@ -91,6 +103,35 @@ Manifest 固定记录不淘汰；额度不足时新增绑定返回 `507`。Blob 
 **实测：** 用真实 TLS 连接在写完前缀后主动断开，Mirror 从该字节偏移发送 `Range` / `If-Range`，保留原查询参数且未复制原请求的 Authorization 或 Cookie，续传后整块摘要一致。另用受控上游响应验证匹配 `206` 的尾字节在 EOF 和正式发布前扣留；`200`、错区间、弱或缺失验证器、重定向和实际体长错误均未发布，随后可重新从零下载。
 
 新版留存入口通过本机 Docker Engine 拉取 `registry.k8s.io/pause:3.9`，以及本机 Skopeo 拉取 `docker.io/library/alpine:3.22` 并核对镜像层摘要。这两项是实际 Registry 的正常拉取回归，断线续传由上面的受控场景验收。
+
+### 本轮认证、复用与 S3 验收
+
+- **Basic：** 实际 Zot v2.1.15 使用两个 htpasswd 账号验证 `registry.k8s.io/pause:3.10`。有 `read` 权限的账号在空缓存和热缓存都得到 `200`，直接 Zot 返回 `404 NAME_UNKNOWN`；未登录和密码错误均为 `401`，有效账号没有仓库 `read` 权限时冷、热均为 `403`。Skopeo 复制了 linux/amd64 镜像，Manifest、config 和 layer 均核对摘要。Blob `GET` 成功，冷、热 Blob `HEAD` 仍与 Zot 一样返回 `404`。
+- **出站复用：** 顺序 TLS 验收里，同一仓库两次 Manifest GET 和一次经 CDN 的 Blob GET 共用一次匿名令牌交换。另一个仓库和另一个 Registry 各自获取 token；同源资源 `401` 触发一次重新握手，响应挑战不能把别的仓库 scope 加进新令牌。耗尽一个 Registry 的突发额度不妨碍另一个 Registry 发请求。没有运行并发压测。
+- **真实匿名 Bearer 上游：** 使用新版 Mirror 和空缓存，经 Basic 下游入口完整冷拉 Docker Hub `docker.io/library/alpine:3.22` 的 linux/amd64 镜像，核对 config 与 layer 的 SHA-256。
+
+隔离环境使用 [RustFS](https://rustfs.com/) `1.0.0-beta.11` 和实际 S3 `storage.storageDriver`。Zot v2.1.15 与 v2.1.23 均完成镜像上传、拉取和 RustFS 对象核对。S3 Blob 重定向由 [Zot v2.1.18](https://github.com/project-zot/zot/releases/tag/v2.1.18) 引入，本轮在 v2.1.23 设置 `storage.redirectBlobURL: true`：
+
+| 请求 | Zot v2.1.15 | Zot v2.1.23 经过启用 Basic 回退的 Mirror |
+| --- | --- | --- |
+| 已授权的完整 Blob GET | `200`，无 `Location` | `307`，`Location` 与直连 Zot 逐字一致 |
+| 匿名 Blob GET | `401`，无 `Location` | `401`，无 `Location` |
+| 已授权 Blob HEAD | `200` | `200` |
+| 已授权 Blob Range | `206`，直接出流 | `206`，直接出流，范围与字节一致 |
+
+签名 URL 不带 Registry `Authorization` 可直接从 RustFS 下载并通过 OCI 层摘要校验；移除签名查询参数则返回 `403`。Mirror 不跟随或改写 Zot 的 `Location`。部署时 S3 签名 URL 必须对客户端可达，且应使用受信任的 HTTPS；隔离 fixture 中的私网 HTTP 地址不适用于对外部署。
+
+### 原生客户端 JWT/TLS 拉取
+
+新版 Mirror 使用独立空缓存，复用留存 Zot、签发端和私有 CA，不修改留存入口。三个客户端各自从空客户端存储起步，选中 `linux/amd64`，随后分别用原客户端存储和全新客户端存储再次拉取。Mirror 的发布日志确认各 Tag 的 Index、所选子 Manifest 和 Zot 缺失的 Blob 已冷回源；`pause:3.10` 的 config Blob 已在 Zot，直接由 Zot 提供。
+
+| 客户端 | `registry.k8s.io/pause` Tag | 所选 Manifest SHA-256 |
+| --- | --- | --- |
+| ctr + 独立 containerd 2.1.9 | `3.9` | `8d4106c88ec0bd28001e34c975d65175d994072d65341f62a8ab0754b0fafe10` |
+| nerdctl 2.3.4 + 独立 containerd 2.1.9 | `3.10`，另测直接拉取子 digest | `7c38f24774e3cbd906d2d33c38354ccf787635581c122965132c9bd309754d4a` |
+| Podman 5.8.10 | `3.10.1` | `e5b941ef8f71de54dc3a13398226c269ba217d06650a21bd3afcf9d890cf1f41` |
+
+三者均无 Blob HEAD，Blob HEAD 只查 Zot 没有阻断本轮冷拉。ctr 用 `--local --platform linux/amd64 --skip-metadata`；不跳过非目标平台元数据时，原配额下出现 `503`。nerdctl 用 `--platform linux/amd64 --unpack=false` 且核对了本地 content store 中 config 与层的摘要；隔离 daemon 上的 snapshot 解包遇到 `no unpack platforms defined`，未宣称解包或运行容器通过。没有为每种客户端重跑 Push/同名覆盖矩阵。
 
 ## Smoke：按阶段执行
 
@@ -367,7 +408,6 @@ docker run --rm --network "$JWT_NETWORK" --add-host "$JWT_HOST:$JWT_IP" \
 
 ## 延后项与下一阶段顺序
 
-1. **部署验证。** P0 的信任边界仅涵盖上面限定的专用 Zot 和传统 Registry Bearer JWT，不支持通用 OIDC、权限隐藏型后端、集群或远端同步。对外开放前按实际签发策略和目标版本复核错误 issuer/audience/scope、过期 token、权限隐藏和后端故障均不能触发回退；确认入站凭据不进入公网请求。
-2. **多上游调度。** 现有配额限制全局与每个逻辑 Registry 的并发及暂存；尚无更细的速率策略或有界、可复用的 Bearer 上下文。
-3. **续传兼容性。** 本实现只续传一次完整剩余区间，暂不支持依赖续传重定向、分段返回或多次续传的上游。普通下载仍不分片、不并行。
-4. **上线验收。** 本文的验收只针对宿主机 Docker 与 Skopeo，不代表其它客户端或完整多架构矩阵。若客户端依赖 Blob HEAD `200` 才能 Pull，不能靠伪造成功响应通过验收。
+1. **部署验证。** 信任边界仅涵盖专用 Zot 的 htpasswd Basic 或传统 Registry Bearer JWT，不支持 OIDC、权限隐藏型后端、集群或远端同步。上线前按部署采用的认证、访问策略与 Zot 版本复核授权和可信缺失契约。
+2. **续传兼容性。** 本实现只续传一次完整剩余区间，暂不支持依赖续传重定向、分段返回或多次续传的上游。普通下载仍不分片、不并行。
+3. **客户端边界。** 只声明实测的版本、拉取方式和平台。若某客户端依赖 Blob HEAD `200` 才能 Pull，不能靠伪造成功响应通过验收。本轮不追加 Zot 故障注入和后端超时验收。

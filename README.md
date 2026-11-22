@@ -130,11 +130,17 @@ kill -0 "$mirror_pid"
 
 可将 `repo`、`tag` 改为 `r.ltkk.run/library/alpine`、`latest`，并额外传 `-poc-private-dns-host r.ltkk.run`。这只是启动示例的替代源；后面的多架构验收流程使用 `pause`。
 
+### HTTP Basic 模式
+
+也可将专用 Zot 配置改为仅使用 `http.auth.htpasswd.path`（绝对路径），将 htpasswd 文件只读挂载给 Zot，并从 Mirror 启动命令移除 `-jwt-issuer`。保留 `-zot-config`，客户端从 HTTPS 入口执行 Registry 登录；该模式不需要 docker-auth 或 `/auth` 路由。按需在 Zot `http.accessControl` 授予原仓库名的 `read` 权限；拒绝结果不会命中任何公网回源或 Mirror 缓存。不要混配 Basic、Bearer 或 OIDC。
+
 ## 动态上游
 
 通过下游授权、确认是可信本地缺失后，启用 `-poc-enable-fallback` 且省略 `-poc-public-repo` 即默认允许符合出站策略的显式 Registry，例如 `docker.io/library/alpine` 或 `registry.k8s.io/pause`。`-poc-allow-registry`、`-poc-deny-registry` 都可重复：未设置 allow 列表时不额外限制 Registry；配置 deny 时 deny 始终优先。只开放几个仓库时，重复 `-poc-public-repo` 限定范围；`alpine`、`library/alpine` 等短名必须逐个用该选项批准。不开 `-poc-enable-fallback` 时仅转发 Zot。
 
 规范化只用于确定回源位置：Docker Hub 的 API 是 `registry-1.docker.io`，官方镜像补 `library/`；Zot 路径、JWT scope 和覆盖 Tag 保持客户端原仓库名，缓存同时按原仓库名和规范化来源隔离。上游须支持匿名 HTTPS/443，不能用路径指定端口、IP 或上游凭据。
+
+匿名上游的连接池和同仓库 pull token 可复用；速率与鉴权上下文数有界，见[出站参数](docs/poc.md#匿名上游与出站策略)。
 
 ## 持久缓存
 

@@ -14,14 +14,21 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
 
-// The operator mounts this exact configuration and certificate read-only for
-// both processes. Startup checks the challenge, not Zot's in-memory policies;
-// enabling hot reload or inserting an intermediary breaks this trust contract.
-func loadZotAuth(path, issuer string) (*bearerAuth, error) {
+type zotAuth struct {
+	bearer         *bearerAuth
+	basicChallenge string
+}
+
+// The operator supplies the same immutable config to both processes. Only
+// Bearer needs a shared signer certificate; Mirror never opens the htpasswd
+// file. Startup checks the challenge, not Zot's in-memory policies, so hot
+// reload or inserting an intermediary breaks this trust contract.
+func loadZotAuth(path, issuer string) (*zotAuth, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -49,15 +56,42 @@ func loadZotAuth(path, issuer string) (*bearerAuth, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Zot http: %w", err)
 	}
-	if zotConfigured(httpConfig["accesscontrol"]) {
-		return nil, errors.New("dedicated Zot must not configure http.accessControl")
-	}
 	authConfig, err := zotJSONObject(httpConfig["auth"])
 	if err != nil {
 		return nil, fmt.Errorf("Zot http.auth: %w", err)
 	}
-	if len(authConfig) != 1 || !zotConfigured(authConfig["bearer"]) {
-		return nil, errors.New("Zot http.auth must contain only bearer")
+	if len(authConfig) != 1 {
+		return nil, errors.New("Zot http.auth must contain only bearer or only htpasswd")
+	}
+	if zotConfigured(authConfig["htpasswd"]) {
+		if issuer != "" {
+			return nil, errors.New("-jwt-issuer is not allowed with Zot htpasswd Basic authentication")
+		}
+		htpasswd, err := zotJSONObject(authConfig["htpasswd"])
+		if err != nil {
+			return nil, fmt.Errorf("Zot http.auth.htpasswd: %w", err)
+		}
+		var htpasswdPath string
+		if len(htpasswd) != 1 || json.Unmarshal(htpasswd["path"], &htpasswdPath) != nil || !filepath.IsAbs(htpasswdPath) {
+			return nil, errors.New("Zot http.auth.htpasswd must contain only an absolute path")
+		}
+		var realm string
+		if zotConfigured(httpConfig["realm"]) && json.Unmarshal(httpConfig["realm"], &realm) != nil {
+			return nil, errors.New("Zot http.realm must be a string")
+		}
+		if realm == "" {
+			realm = "Authorization Required"
+		}
+		return &zotAuth{basicChallenge: "Basic realm=" + strconv.Quote(realm)}, nil
+	}
+	if !zotConfigured(authConfig["bearer"]) {
+		return nil, errors.New("Zot http.auth must contain only bearer or only htpasswd")
+	}
+	if zotConfigured(httpConfig["accesscontrol"]) {
+		return nil, errors.New("dedicated Bearer Zot must not configure http.accessControl")
+	}
+	if issuer == "" {
+		return nil, errors.New("-jwt-issuer is required with Zot traditional Bearer authentication")
 	}
 	bearer, err := zotJSONObject(authConfig["bearer"])
 	if err != nil {
@@ -75,7 +109,11 @@ func loadZotAuth(path, issuer string) (*bearerAuth, error) {
 	if !filepath.IsAbs(cert) {
 		return nil, errors.New("Zot http.auth.bearer.cert must be an absolute shared path")
 	}
-	return newBearerAuth(cert, issuer, service, realm)
+	auth, err := newBearerAuth(cert, issuer, service, realm)
+	if err != nil {
+		return nil, err
+	}
+	return &zotAuth{bearer: auth}, nil
 }
 
 func zotConfigured(value json.RawMessage) bool {
@@ -117,7 +155,7 @@ func zotJSONObject(data []byte) (map[string]json.RawMessage, error) {
 
 // The supplied transport is the dedicated, proxy-disabled Zot transport. A
 // single RoundTrip cannot follow redirects or pick up client credentials.
-func verifyZot(ctx context.Context, origin *url.URL, auth *bearerAuth, transport http.RoundTripper) error {
+func verifyZot(ctx context.Context, origin *url.URL, auth *zotAuth, transport http.RoundTripper) error {
 	addr, err := netip.ParseAddr(origin.Hostname())
 	if err != nil || !addr.IsLoopback() || origin.Scheme != "http" || origin.User != nil {
 		return errors.New("Zot verification requires a direct loopback HTTP origin")
@@ -133,14 +171,20 @@ func verifyZot(ctx context.Context, origin *url.URL, auth *bearerAuth, transport
 	}
 	defer resp.Body.Close()
 	challenge := resp.Header.Values("WWW-Authenticate")
-	if resp.StatusCode != http.StatusUnauthorized || len(challenge) != 1 || challenge[0] != auth.challengeHeader("") {
-		return fmt.Errorf("Zot /v2/ did not return the configured unscoped Bearer challenge (status %d)", resp.StatusCode)
+	expected, mode := auth.basicChallenge, "Basic"
+	if auth.bearer != nil {
+		expected, mode = auth.bearer.challengeHeader(""), "unscoped Bearer"
+	}
+	// Zot's Basic middleware permits anonymous /v2/ if any repository has
+	// an anonymous policy; such a deployment fails this challenge check.
+	if resp.StatusCode != http.StatusUnauthorized || len(challenge) != 1 || challenge[0] != expected {
+		return fmt.Errorf("Zot /v2/ did not return the configured %s challenge (status %d)", mode, resp.StatusCode)
 	}
 	return nil
 }
 
-// The caller has checked exact pull scope and supplies the original, direct Zot
-// response. These probes observe a point in time; neither serializes a
+// The caller has checked the authentication profile and supplies the original,
+// direct Zot response. These probes observe a point in time; neither serializes a
 // concurrent push. The original result stands if either observation disagrees.
 func trustedZotMiss(resp *http.Response, read readRequest, transport http.RoundTripper) bool {
 	if !zotJSON404(resp) || resp.Request == nil {

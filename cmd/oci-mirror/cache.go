@@ -38,7 +38,7 @@ type mirrorCache struct {
 	*cacheStorage
 	ctx       context.Context
 	cancel    context.CancelFunc
-	transport http.RoundTripper
+	upstream  *upstreamPool
 	quota     fetchQuota
 	blobMu    sync.Mutex
 	blobTasks map[cacheKey]*blobFlight
@@ -62,18 +62,24 @@ type manifest struct {
 	body              []byte
 }
 
-func newMirrorCache(ctx context.Context, dir string, transport http.RoundTripper, limits cacheLimits) (*mirrorCache, error) {
+func newMirrorCache(ctx context.Context, dir string, transport http.RoundTripper, limits cacheLimits, upstreamLimit upstreamLimits) (*mirrorCache, error) {
 	if err := limits.validate(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	upstream, err := newUpstreamPool(ctx, transport, upstreamLimit)
+	if err != nil {
+		cancel()
 		return nil, err
 	}
 	store, err := openCacheStorage(ctx, dir, limits)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	ctx, cancel := context.WithCancel(ctx)
 	return &mirrorCache{
 		cacheStorage: store,
-		ctx:          ctx, cancel: cancel, transport: transport,
+		ctx:          ctx, cancel: cancel, upstream: upstream,
 		quota:     fetchQuota{limits: limits, origin: make(map[string]*originUsage)},
 		blobTasks: make(map[cacheKey]*blobFlight),
 	}, nil
@@ -140,9 +146,13 @@ func (c *mirrorCache) fetchManifest(ctx context.Context, repo resolvedRepository
 		return nil, err
 	}
 	defer c.quota.release(repo.logicalRegistry, usage)
+	client, release, err := c.upstream.acquire(ctx, repo.source)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	ref := key.reference
-	source := publicSource{repo: repo.source, transport: c.transport}
-	resp, _, err := source.get(ctx, "manifests", ref, strings.Join(allowed, ", "))
+	resp, err := getUpstream(ctx, client, repo.source, "manifests", ref, strings.Join(allowed, ", "))
 	if err != nil {
 		return nil, err
 	}
@@ -322,8 +332,12 @@ func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight
 	if err != nil {
 		return cacheStorageError(err)
 	}
-	source := publicSource{repo: repo.source, transport: c.transport}
-	resp, client, err := source.get(ctx, "blobs", key.reference, "")
+	client, release, err := c.upstream.acquire(ctx, repo.source)
+	if err != nil {
+		return err
+	}
+	defer release()
+	resp, err := getUpstream(ctx, client, repo.source, "blobs", key.reference, "")
 	if err != nil {
 		return err
 	}

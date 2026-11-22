@@ -41,7 +41,7 @@ func newZotTransport() *http.Transport {
 	return transport
 }
 
-func overlay(zot *url.URL, policy fallbackPolicy, cache *mirrorCache, auth *bearerAuth, transport *http.Transport) http.Handler {
+func overlay(zot *url.URL, policy fallbackPolicy, cache *mirrorCache, auth *zotAuth, transport *http.Transport) http.Handler {
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -49,17 +49,36 @@ func overlay(zot *url.URL, policy fallbackPolicy, cache *mirrorCache, auth *bear
 			r.Out.Host = r.In.Host
 			r.Out.URL.RawQuery = r.In.URL.RawQuery
 			r.SetXForwarded()
+			if auth != nil && auth.bearer == nil {
+				// Zot can otherwise use its UI session instead of htpasswd and
+				// suppress the Basic challenge on authentication failure.
+				r.Out.Header.Del("Cookie")
+				r.Out.Header.Del("X-Zot-Api-Client")
+			}
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			if cache == nil || resp.StatusCode != http.StatusNotFound {
+			if cache == nil || auth == nil || resp.StatusCode != http.StatusNotFound || resp.Request == nil {
 				return nil
 			}
-			claims, ok := resp.Request.Context().Value(claimsKey{}).(*registryClaims)
+			read, ok := policy.classify(resp.Request)
 			if !ok {
 				return nil
 			}
-			if read, ok := policy.classify(resp.Request); ok &&
-				claims.canPull(read.repository.downstream) && trustedZotMiss(resp, read, transport) {
+			if auth.bearer != nil {
+				claims, ok := resp.Request.Context().Value(claimsKey{}).(*registryClaims)
+				if !ok || !claims.canPull(read.repository.downstream) {
+					return nil
+				}
+			} else {
+				// Check what Zot actually received. In v2.1.15, a nonempty
+				// Basic attempt cannot fall back to anonymous on failure.
+				// The miss must pass htpasswd and any exact-route read ACL.
+				username, _, valid := resp.Request.BasicAuth()
+				if len(resp.Request.Header.Values("Authorization")) != 1 || !valid || username == "" {
+					return nil
+				}
+			}
+			if trustedZotMiss(resp, read, transport) {
 				return &zotMiss{read}
 			}
 			return nil
@@ -74,14 +93,14 @@ func overlay(zot *url.URL, policy fallbackPolicy, cache *mirrorCache, auth *bear
 			registryError(w, http.StatusBadGateway, "UNAVAILABLE", "Zot transport failed")
 		},
 	}
-	if auth == nil {
+	if auth == nil || auth.bearer == nil {
 		return proxy
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if (r.URL.Path == "/v2" || strings.HasPrefix(r.URL.Path, "/v2/")) && r.Method != http.MethodOptions {
-			claims, err := auth.authenticate(r)
+			claims, err := auth.bearer.authenticate(r)
 			if err != nil {
-				auth.writeChallenge(w, r)
+				auth.bearer.writeChallenge(w, r)
 				return
 			}
 			if cache != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
@@ -95,11 +114,12 @@ func overlay(zot *url.URL, policy fallbackPolicy, cache *mirrorCache, auth *bear
 func run() error {
 	listen := flag.String("listen", "127.0.0.1:15000", "loopback listen address")
 	zotURL := flag.String("poc-zot", "", "direct loopback local-only Zot HTTP origin (required)")
-	zotConfig := flag.String("zot-config", "", "same immutable JSON config used by a dedicated local-only Zot")
-	jwtIssuer := flag.String("jwt-issuer", "", "expected issuer of the Zot Docker Registry Bearer JWT")
+	zotConfig := flag.String("zot-config", "", "same immutable JSON config used by a dedicated local-only Basic or Bearer Zot")
+	jwtIssuer := flag.String("jwt-issuer", "", "expected JWT issuer (required only for Zot traditional Bearer authentication)")
 	enableFallback := flag.Bool("poc-enable-fallback", false, "enable anonymous upstream reads after a trusted local Zot 404")
 	cacheDir := flag.String("cache-dir", "", "directory for the persistent Mirror cache (required when fallback is enabled)")
 	limits := cacheLimitFlags()
+	upstreamLimit := upstreamLimitFlags()
 	policy := fallbackPolicy{
 		repositories: make(map[string]struct{}),
 		allowed:      make(map[string]struct{}),
@@ -144,11 +164,15 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if (*zotConfig == "") != (*jwtIssuer == "") {
-		return errors.New("-zot-config and -jwt-issuer must be supplied together")
+	var issuerSet bool
+	flag.Visit(func(f *flag.Flag) {
+		issuerSet = issuerSet || f.Name == "jwt-issuer"
+	})
+	if issuerSet && (*zotConfig == "" || strings.TrimSpace(*jwtIssuer) == "") {
+		return errors.New("-jwt-issuer requires -zot-config and a nonempty issuer")
 	}
 	transport := newZotTransport()
-	var auth *bearerAuth
+	var auth *zotAuth
 	if *zotConfig != "" {
 		auth, err = loadZotAuth(*zotConfig, *jwtIssuer)
 		if err != nil {
@@ -167,12 +191,12 @@ func run() error {
 	}
 	if *enableFallback {
 		if auth == nil {
-			return errors.New("-poc-enable-fallback requires -zot-config and -jwt-issuer")
+			return errors.New("-poc-enable-fallback requires -zot-config")
 		}
 		if *cacheDir == "" {
 			return errors.New("-cache-dir is required with -poc-enable-fallback")
 		}
-		cache, err = newMirrorCache(ctx, *cacheDir, newPublicTransport(privateDNSHosts), *limits)
+		cache, err = newMirrorCache(ctx, *cacheDir, newPublicTransport(privateDNSHosts), *limits, *upstreamLimit)
 		if err != nil {
 			return fmt.Errorf("open cache: %w", err)
 		}
