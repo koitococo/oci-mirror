@@ -177,6 +177,19 @@ kill -0 "$mirror_pid"
 
 长度可信的完整冷 Blob GET 可以提前收到前缀；末尾至少一字节只会在校验和正式发布成功后发送。Range 和条件请求仍等正式缓存。前置代理须关闭 Registry 响应缓冲，或尊重 Mirror 的 `X-Accel-Buffering: no`；上面的 Nginx 示例已关闭 `/v2/` 的缓冲。
 
+## 按日志排障
+
+Mirror 为每个请求生成 `X-Request-ID`，在响应中返回并传给可信后端（含缺失确认请求），不会传给公网回源。先按该 ID 查 Mirror 日志；Compose 示例可用 `docker compose logs mirror`。
+
+| 事件 | 如何解读 |
+| --- | --- |
+| `backend_response_failed` / `backend_transport_failed` | 后端返回 `5xx`，或 Mirror 未能完成后端 HTTP 请求。`source` 区分主请求和缺失确认；传输失败记录经过分类的 `reason`，不记录原始错误。 |
+| `backend_fallback_skipped` | 后端 `404` 被原样返回。`reason` 区分 Registry 策略、无法识别的缺失响应和补探测没有确认；有探测时查看 `probe_method`、`probe_status` 或 `error_reason`。 |
+| `blob_request_failed` / `blob_response_aborted` | Blob 响应未能完成。用 `request_id` 找到对应 `flight_id`；截断事件还记录 `stage`、`bytes_sent` 和 `bytes_expected`。`reason=producer_failed` 时到下载事件查根因。 |
+| `blob_download_failed` | 每个共享下载只记录一次失败根因。按 `flight_id` 查询 `stage`、`reason`、digest，以及已知的下载偏移和上游状态。一般限额拒绝、正常上游缺失和取消不作为默认告警。 |
+
+这些诊断事件不包含认证头、Cookie、原始 URL/查询参数、签名 URL、验证器或响应体。普通后端 `401`/`403` 仍由后端处理，不逐条记错误。
+
 ## 验收与清理
 
 保持在同一个子 shell，按 [PoC 架构与 smoke 步骤](docs/poc.md) 顺序操作。该流程先读 Manifest、按需缓存公网层，随后从本地目录向同名引用 Push，最后验证覆盖、旧 digest 和删除后回退。预期结果不等于实测报告。

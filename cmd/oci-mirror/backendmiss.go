@@ -5,40 +5,59 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strings"
 	"unicode/utf8"
 )
 
+type backendMissDecision struct {
+	reason, errorReason, probeMethod string
+	probeStatus                      int
+}
+
+func (d backendMissDecision) logSkipped(resp *http.Response, kind string) {
+	ctx := resp.Request.Context()
+	attrs := []slog.Attr{
+		slog.String("request_id", requestID(ctx)),
+		slog.String("method", backendLogMethod(resp.Request.Method)),
+		slog.String("kind", kind),
+		slog.Int("backend_status", resp.StatusCode),
+		slog.String("reason", d.reason),
+	}
+	if d.probeMethod != "" {
+		attrs = append(attrs, slog.String("probe_method", d.probeMethod))
+	}
+	if d.probeStatus != 0 {
+		attrs = append(attrs, slog.Int("probe_status", d.probeStatus))
+	}
+	if d.errorReason != "" {
+		attrs = append(attrs, slog.String("error_reason", d.errorReason))
+	}
+	slog.LogAttrs(ctx, slog.LevelInfo, "backend_fallback_skipped", attrs...)
+}
+
 // The backend must authorize the exact resource before looking it up. These
 // corroborating requests observe a point in time; they do not serialize pushes.
-func trustedBackendMiss(resp *http.Response, read readRequest, transport http.RoundTripper) bool {
-	if !backendJSON404(resp) || resp.Request == nil {
-		return false
+func checkBackendMiss(resp *http.Response, read readRequest, transport backendTransport) backendMissDecision {
+	if reason := backendMissMetadataRejection(resp); reason != "" {
+		return backendMissDecision{reason: reason}
 	}
 	original := resp.Request
-	var method string
-	switch original.Method {
-	case http.MethodGet:
+	// A manifest HEAD has no wire body, so corroborate with a typed GET.
+	method := http.MethodGet
+	if original.Method == http.MethodGet {
 		miss := backendTypedMiss(resp, read)
 		if miss == notBackendMiss {
-			return false
+			return backendMissDecision{reason: "typed_miss_mismatch"}
 		}
 		// Zot v2.1.15 GetManifest also maps ErrRepoBadVersion to 404
 		// NAME_UNKNOWN. Its CheckManifest returns 500, disambiguating it.
 		if read.kind != "manifests" || miss != zotNameMiss {
-			return true
+			return backendMissDecision{}
 		}
 		method = http.MethodHead
-	case http.MethodHead:
-		if read.kind != "manifests" {
-			return false
-		}
-		// HEAD has no wire body, so corroborate with the typed GET result.
-		method = http.MethodGet
-	default:
-		return false
 	}
 
 	probe := &http.Request{
@@ -55,24 +74,44 @@ func trustedBackendMiss(resp *http.Response, read readRequest, transport http.Ro
 	} {
 		probe.Header.Del(key)
 	}
-	confirmed, err := transport.RoundTrip(probe.WithContext(original.Context()))
+	decision := backendMissDecision{probeMethod: method}
+	confirmed, err := transport.roundTrip(probe.WithContext(original.Context()), "probe")
 	if err != nil {
-		return false
+		decision.reason = "probe_transport_failed"
+		decision.errorReason = logErrorReason(err)
+		return decision
 	}
 	defer confirmed.Body.Close()
-	return backendJSON404(confirmed) && (method == http.MethodHead || backendTypedMiss(confirmed, read) != notBackendMiss)
+	decision.probeStatus = confirmed.StatusCode
+	switch {
+	case confirmed.StatusCode >= 500 && confirmed.StatusCode < 600:
+		decision.reason = "probe_backend_5xx"
+	default:
+		if reason := backendMissMetadataRejection(confirmed); reason != "" {
+			decision.reason = "probe_" + reason
+		} else if method == http.MethodGet && backendTypedMiss(confirmed, read) == notBackendMiss {
+			decision.reason = "probe_typed_miss_mismatch"
+		}
+	}
+	return decision
 }
 
-func backendJSON404(resp *http.Response) bool {
-	if resp.StatusCode != http.StatusNotFound || len(resp.Header.Values("WWW-Authenticate")) != 0 {
-		return false
+func backendMissMetadataRejection(resp *http.Response) string {
+	if resp.StatusCode != http.StatusNotFound {
+		return "untrusted_status"
+	}
+	if len(resp.Header.Values("WWW-Authenticate")) != 0 {
+		return "untrusted_challenge"
 	}
 	types := resp.Header.Values("Content-Type")
 	if len(types) != 1 {
-		return false
+		return "untrusted_content_type"
 	}
 	mediaType, _, err := mime.ParseMediaType(types[0])
-	return err == nil && mediaType == "application/json"
+	if err != nil || mediaType != "application/json" {
+		return "untrusted_content_type"
+	}
+	return ""
 }
 
 type backendBufferedBody struct {

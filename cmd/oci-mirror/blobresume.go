@@ -11,6 +11,21 @@ import (
 	"strings"
 )
 
+// blobTransferFailure carries diagnostic metadata without changing the cause.
+type blobTransferFailure struct {
+	stage, reason  string
+	offset         int64
+	upstreamStatus int
+	err            error
+}
+
+func (e *blobTransferFailure) Error() string { return e.err.Error() }
+func (e *blobTransferFailure) Unwrap() error { return e.err }
+
+func newBlobTransferFailure(stage, reason string, offset int64, status int, err error) *blobTransferFailure {
+	return &blobTransferFailure{stage: stage, reason: reason, offset: offset, upstreamStatus: status, err: err}
+}
+
 func copyVerifiedBlob(file *os.File, initial *http.Response, client *http.Client, digest string, limit int64, exact bool, progress io.Writer) (int64, error) {
 	body := initial.Body
 	defer func() {
@@ -26,47 +41,57 @@ func copyVerifiedBlob(file *os.File, initial *http.Response, client *http.Client
 		count++
 	}
 	stage := io.MultiWriter(writers[:count]...)
+	stageName, status := "transfer", initial.StatusCode
+	readReason := "upstream_read_failed"
 	n, err := io.Copy(stage, io.LimitReader(blobReadSource{body}, limit))
 	if readErr, ok := err.(blobReadError); ok {
 		err = readErr.error
 	} else if err != nil {
-		return 0, blobStageWriteError(err)
+		return 0, newBlobTransferFailure(stageName, "stage_write_failed", n, status, blobStageWriteError(err))
 	}
 	if err == nil && exact && n < limit {
 		err = errors.New("upstream blob shorter than expected")
+		readReason = "upstream_blob_short"
 	}
 	if err != nil {
 		etag := blobStrongETag(initial.Header)
 		if !exact || n <= 0 || n >= limit || etag == "" || !blobIdentityEncoding(initial) ||
 			initial.Request == nil || initial.Request.URL == nil || client == nil {
-			return 0, err
+			return 0, newBlobTransferFailure(stageName, readReason, n, status, err)
 		}
 		if err := initial.Request.Context().Err(); err != nil {
-			return 0, err
+			return 0, newBlobTransferFailure("resume", "resume_request_canceled", n, 0, err)
 		}
 		_ = body.Close()
 		// The deferred close now belongs to the resumed segment, if any.
 		body = http.NoBody
 		resume, err := requestBlobSuffix(initial.Request, client, n, etag)
 		if err != nil {
-			return 0, err
+			return 0, newBlobTransferFailure("resume", "resume_request_failed", n, 0, err)
 		}
 		body = resume.Body
+		stageName, status = "resume", resume.StatusCode
 		if !validBlobSuffix(resume, n, limit, etag) {
-			return 0, errors.New("upstream blob resume response does not match the requested suffix")
+			reason := "resume_response_rejected"
+			if status != http.StatusPartialContent {
+				reason = "resume_status_rejected"
+			}
+			return 0, newBlobTransferFailure(stageName, reason, n, status,
+				errors.New("upstream blob resume response does not match the requested suffix"))
 		}
 		remaining := limit - n
 		copied, err := io.Copy(stage, io.LimitReader(blobReadSource{body}, remaining))
+		n += copied
 		if readErr, ok := err.(blobReadError); ok {
-			return 0, readErr.error
+			return 0, newBlobTransferFailure(stageName, "upstream_read_failed", n, status, readErr.error)
 		}
 		if err != nil {
-			return 0, blobStageWriteError(err)
+			return 0, newBlobTransferFailure(stageName, "stage_write_failed", n, status, blobStageWriteError(err))
 		}
 		if copied != remaining {
-			return 0, errors.New("upstream blob resume response shorter than expected")
+			return 0, newBlobTransferFailure(stageName, "upstream_blob_short", n, status,
+				errors.New("upstream blob resume response shorter than expected"))
 		}
-		n += copied
 	}
 
 	// Check EOF without writing an extra byte past the staging reservation.
@@ -74,16 +99,18 @@ func copyVerifiedBlob(file *os.File, initial *http.Response, client *http.Client
 		var tail [1]byte
 		if _, err := io.ReadFull(body, tail[:]); err != io.EOF {
 			if err != nil {
-				return 0, err
+				return 0, newBlobTransferFailure(stageName, "upstream_read_failed", n, status, err)
 			}
 			if !exact && limit < maxBlobBytes {
-				return 0, errCacheFull
+				return 0, newBlobTransferFailure(stageName, "upstream_blob_excess", n, status, errCacheFull)
 			}
-			return 0, errors.New("upstream blob longer than allowed")
+			return 0, newBlobTransferFailure(stageName, "upstream_blob_excess", n, status,
+				errors.New("upstream blob longer than allowed"))
 		}
 	}
 	if "sha256:"+hex.EncodeToString(h.Sum(nil)) != digest {
-		return 0, errors.New("upstream blob digest mismatch")
+		return 0, newBlobTransferFailure("verify", "digest_mismatch", n, status,
+			errors.New("upstream blob digest mismatch"))
 	}
 	return n, nil
 }

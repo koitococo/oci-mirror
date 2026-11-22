@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -262,11 +263,12 @@ func (c *mirrorCache) serveBlob(w http.ResponseWriter, r *http.Request, repo res
 	}
 	if err := flight.wait(r.Context()); err != nil {
 		if r.Context().Err() == nil {
-			fetchError(w, "blobs", err)
+			blobRequestFailed(r.Context(), key, flight, "", err)
+			writeFetchError(w, "blobs", err, false)
 		}
 		return
 	}
-	c.servePublishedBlob(w, r, key)
+	c.servePublishedBlob(w, r, key, flight)
 }
 
 func (c *mirrorCache) joinBlobFlight(repo resolvedRepository, key cacheKey) *blobFlight {
@@ -280,7 +282,26 @@ func (c *mirrorCache) joinBlobFlight(repo resolvedRepository, key cacheKey) *blo
 	go func() {
 		unpin := c.blobs.pin(key)
 		defer unpin()
-		err := c.downloadBlob(repo, key, flight)
+		expected, err := c.downloadBlob(repo, key, flight)
+		if err != nil {
+			failure := blobFailure(err)
+			attrs := []any{"flight_id", flight.id, "digest", key.reference, "logical_registry", repo.logicalRegistry,
+				"stage", failure.stage, "reason", failure.reason}
+			if expected >= 0 {
+				attrs = append(attrs, "bytes_expected", expected)
+			}
+			if failure.offset >= 0 {
+				attrs = append(attrs, "offset", failure.offset)
+			}
+			if failure.upstreamStatus != 0 {
+				attrs = append(attrs, "upstream_status", failure.upstreamStatus)
+			}
+			level := slog.LevelWarn
+			if fetchUpstreamStatus(err) == http.StatusNotFound || errors.Is(err, errBusy) || errors.Is(err, errCacheFull) || errors.Is(err, context.Canceled) {
+				level = slog.LevelDebug
+			}
+			slog.Log(c.ctx, level, "blob_download_failed", attrs...)
+		}
 		// Staging is closed and quotas are released. Retire the flight before
 		// notifying waiters so an immediate retry cannot join a failed flight.
 		c.blobMu.Lock()
@@ -291,9 +312,10 @@ func (c *mirrorCache) joinBlobFlight(repo resolvedRepository, key cacheKey) *blo
 	return flight
 }
 
-func (c *mirrorCache) servePublishedBlob(w http.ResponseWriter, r *http.Request, key cacheKey) {
+func (c *mirrorCache) servePublishedBlob(w http.ResponseWriter, r *http.Request, key cacheKey, flight *blobFlight) {
 	f, err := c.blobs.open(r.Context(), key)
 	if err != nil {
+		blobRequestFailed(r.Context(), key, flight, "published_open", err)
 		registryError(w, http.StatusInternalServerError, "UNKNOWN", "cannot open verified blob")
 		return
 	}
@@ -312,105 +334,140 @@ func serveVerifiedBlob(w http.ResponseWriter, r *http.Request, digest string, f 
 	http.ServeContent(w, r, digest, time.Time{}, f)
 }
 
-func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight *blobFlight) (result error) {
+func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight *blobFlight) (expected int64, result error) {
 	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Minute)
 	defer cancel()
+	stage, reason := "cache_open", ""
+	expected = -1
+	offset, status := int64(-1), 0
+	defer func() {
+		if result == nil {
+			return
+		}
+		var failure *blobTransferFailure
+		if errors.As(result, &failure) {
+			return
+		}
+		if upstreamStatus := fetchUpstreamStatus(result); upstreamStatus != 0 {
+			status = upstreamStatus
+			reason = "upstream_status"
+		}
+		if reason == "" {
+			reason = logErrorReason(result)
+		}
+		result = &blobTransferFailure{stage: stage, reason: reason, offset: offset, upstreamStatus: status, err: result}
+	}()
 	f, err := c.blobs.open(ctx, key)
 	if err == nil {
-		return cacheStorageError(f.Close())
+		stage = "cache_close"
+		return expected, cacheStorageError(f.Close())
 	}
 	if !errors.Is(err, os.ErrNotExist) {
-		return cacheStorageError(err)
+		return expected, cacheStorageError(err)
 	}
+	stage = "quota_acquire"
 	usage, err := c.quota.acquire(repo.logicalRegistry)
 	if err != nil {
-		return err
+		return expected, err
 	}
 	defer c.quota.release(repo.logicalRegistry, usage)
 
-	expected, known, err := c.manifests.blobSize(ctx, key)
+	stage = "manifest_lookup"
+	size, known, err := c.manifests.blobSize(ctx, key)
 	if err != nil {
-		return cacheStorageError(err)
+		return expected, cacheStorageError(err)
 	}
+	if known {
+		expected = size
+	}
+	stage = "upstream_acquire"
 	client, release, err := c.upstream.acquire(ctx, repo.source)
 	if err != nil {
-		return err
+		return expected, err
 	}
 	defer release()
+	stage = "upstream_get"
 	resp, err := getUpstream(ctx, client, repo.source, "blobs", key.reference, "")
 	if err != nil {
-		return err
+		return expected, err
 	}
+	status = resp.StatusCode
 	defer func() {
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
 	}()
+	stage = "validate_length"
 	if known && resp.ContentLength >= 0 && expected != resp.ContentLength {
-		return errors.New("upstream blob length does not match the Manifest")
+		reason = "length_mismatch"
+		return expected, errors.New("upstream blob length does not match the Manifest")
 	}
 	if !known && resp.ContentLength >= 0 {
 		expected, known = resp.ContentLength, true
 	}
 	if known && expected > maxBlobBytes {
-		return errors.New("upstream blob length above single-blob limit")
+		reason = "blob_too_large"
+		return expected, errors.New("upstream blob length above single-blob limit")
 	}
 	limits := c.quota.limits
 	limit := min(int64(maxBlobBytes), limits.blobBytes, limits.stagingBytes, limits.upstreamStagingBytes)
+	stage = "quota_reserve"
 	if known {
 		if expected > limit {
-			return errCacheFull
+			return expected, errCacheFull
 		}
 		limit = expected
 	}
 	if err := c.quota.reserve(usage, limit); err != nil {
-		return err
+		return expected, err
 	}
 	defer c.quota.releaseStaging(usage, limit)
+	stage = "staging_create"
 
 	file, err := os.CreateTemp(c.staging, "blob-")
 	if err != nil {
-		return cacheStorageError(err)
+		return expected, cacheStorageError(err)
 	}
 	defer os.Remove(file.Name())
 	// Close the shared staging reader before removing the stage and releasing
 	// its reservation. No downstream network write holds that descriptor.
-	defer func() {
-		if result != nil {
-			log.Printf("mirror staged blob failed digest=%s error_type=%T", key.reference, result)
-		}
-		flight.closeStaging()
-	}()
+	defer flight.closeStaging()
 	var progress io.Writer
 	if known && expected > 1 {
+		stage = "staging_open"
 		reader, err := os.Open(file.Name())
 		if err != nil {
 			_ = file.Close()
-			return cacheStorageError(err)
+			return expected, cacheStorageError(err)
 		}
 		flight.startStreaming(reader, expected)
 		progress = blobProgress{flight}
 	}
 	initial := resp
 	resp = nil // The transfer owns the initial body, including on a resume.
+	stage = "transfer"
 	n, err := copyVerifiedBlob(file, initial, client, key.reference, limit, known, progress)
+	offset = n
 	if err != nil {
 		_ = file.Close()
-		return err
+		return expected, err
 	}
+	stage = "staging_sync_close"
 	syncErr := file.Sync()
 	closeErr := file.Close()
 	if err := errors.Join(syncErr, closeErr); err != nil {
-		return cacheStorageError(err)
+		return expected, cacheStorageError(err)
 	}
+	stage = "before_publish"
 	if err := ctx.Err(); err != nil {
-		return err
+		return expected, err
 	}
+	stage = "publish"
 	if err := c.blobs.publish(ctx, key, file.Name(), n); err != nil {
-		return cacheStorageError(err)
+		return expected, cacheStorageError(err)
 	}
 	log.Printf("mirror blob published digest=%s bytes=%d", key.reference, n)
-	return nil
+	return expected, nil
 }
 
 type blobProgress struct{ flight *blobFlight }
@@ -421,24 +478,37 @@ func (p blobProgress) Write(data []byte) (int, error) {
 }
 
 func fetchError(w http.ResponseWriter, kind string, err error) {
+	writeFetchError(w, kind, err, true)
+}
+
+func fetchUpstreamStatus(err error) int {
 	var upstream *upstreamStatus
 	var transport *registry.Error
-	status := 0
 	if errors.As(err, &upstream) {
-		status = upstream.status
-	} else if errors.As(err, &transport) {
-		status = transport.StatusCode
+		return upstream.status
 	}
+	if errors.As(err, &transport) {
+		return transport.StatusCode
+	}
+	return 0
+}
+
+func writeFetchError(w http.ResponseWriter, kind string, err error, diagnostics bool) {
+	status := fetchUpstreamStatus(err)
 	switch {
 	case errors.Is(err, errBusy):
 		registryError(w, http.StatusServiceUnavailable, "UNAVAILABLE", "global or upstream cold fetch limit reached")
 	case errors.Is(err, errCacheFull):
 		registryError(w, http.StatusInsufficientStorage, "UNAVAILABLE", "Mirror cache quota exhausted")
 	case errors.Is(err, errCacheStorage):
-		log.Printf("mirror cache failed kind=%s: %v", kind, err)
+		if diagnostics {
+			log.Printf("mirror cache failed kind=%s: %v", kind, err)
+		}
 		registryError(w, http.StatusInternalServerError, "UNKNOWN", "local Mirror cache failed")
 	case errors.Is(err, errPublicURL), errors.Is(err, errPublicIP), errors.Is(err, errPrivateDNS):
-		log.Printf("mirror egress policy rejected kind=%s", kind)
+		if diagnostics {
+			log.Printf("mirror egress policy rejected kind=%s", kind)
+		}
 		registryError(w, http.StatusBadGateway, "UNAVAILABLE", "upstream rejected by egress policy")
 	case status == http.StatusNotFound:
 		code := "MANIFEST_UNKNOWN"
@@ -450,7 +520,9 @@ func fetchError(w http.ResponseWriter, kind string, err error) {
 		registryError(w, status, "MANIFEST_UNKNOWN", "upstream manifest media type not accepted")
 	default:
 		// Upstream errors may contain signed URLs or token response bodies.
-		log.Printf("mirror fetch failed kind=%s upstream_status=%d error_type=%T", kind, status, err)
+		if diagnostics {
+			log.Printf("mirror fetch failed kind=%s upstream_status=%d error_type=%T", kind, status, err)
+		}
 		registryError(w, http.StatusBadGateway, "UNAVAILABLE", "upstream fetch or verification failed")
 	}
 }

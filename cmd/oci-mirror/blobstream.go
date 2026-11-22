@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 // blobFlight shares staging progress without tying the producer to any request.
 // The writer only extends the staged prefix; readers never share a file offset.
 type blobFlight struct {
+	id      string
 	mu      sync.Mutex
 	changed chan struct{}
 	done    chan struct{}
@@ -25,7 +27,7 @@ type blobFlight struct {
 }
 
 func newBlobFlight() *blobFlight {
-	return &blobFlight{done: make(chan struct{})}
+	return &blobFlight{id: newLogID(), done: make(chan struct{})}
 }
 
 func (f *blobFlight) notifyLocked() {
@@ -89,6 +91,37 @@ func earlyBlobGET(r *http.Request) bool {
 	return true
 }
 
+func blobFailure(err error) *blobTransferFailure {
+	var failure *blobTransferFailure
+	if errors.As(err, &failure) {
+		return failure
+	}
+	return &blobTransferFailure{stage: "download", reason: logErrorReason(err), offset: -1, err: err}
+}
+
+func blobRequestFailed(ctx context.Context, key cacheKey, f *blobFlight, stage string, err error) {
+	level := slog.LevelWarn
+	if ctx.Err() != nil || fetchUpstreamStatus(err) == http.StatusNotFound || errors.Is(err, errBusy) || errors.Is(err, errCacheFull) {
+		level = slog.LevelDebug
+	}
+	if stage != "" {
+		slog.Log(ctx, level, "blob_request_failed", "request_id", requestID(ctx), "flight_id", f.id, "digest", key.reference,
+			"stage", stage, "reason", logErrorReason(err))
+		return
+	}
+	slog.Log(ctx, level, "blob_request_failed", "request_id", requestID(ctx), "flight_id", f.id, "digest", key.reference)
+}
+
+func abortBlobResponse(ctx context.Context, key cacheKey, f *blobFlight, stage, reason string, sent, expected int64) {
+	level := slog.LevelWarn
+	if ctx.Err() != nil {
+		level = slog.LevelDebug
+	}
+	slog.Log(ctx, level, "blob_response_aborted", "request_id", requestID(ctx), "flight_id", f.id, "digest", key.reference,
+		"stage", stage, "reason", reason, "bytes_sent", sent, "bytes_expected", expected)
+	panic(http.ErrAbortHandler)
+}
+
 func (c *mirrorCache) serveColdBlob(w http.ResponseWriter, r *http.Request, key cacheKey, f *blobFlight) {
 	ctx := r.Context()
 	var offset int64
@@ -117,25 +150,32 @@ func (c *mirrorCache) serveColdBlob(w http.ResponseWriter, r *http.Request, key 
 		if finished {
 			if err != nil {
 				if offset != 0 {
-					panic(http.ErrAbortHandler)
+					failure := blobFailure(err)
+					abortBlobResponse(ctx, key, f, failure.stage, "producer_failed", offset, length)
+					return
 				}
-				fetchError(w, "blobs", err)
+				blobRequestFailed(ctx, key, f, "", err)
+				writeFetchError(w, "blobs", err, false)
 				return
 			}
 			if offset == 0 {
-				c.servePublishedBlob(w, r, key)
+				c.servePublishedBlob(w, r, key, f)
 				return
 			}
 			published, err := c.blobs.open(ctx, key)
 			if err != nil {
-				panic(http.ErrAbortHandler)
+				abortBlobResponse(ctx, key, f, "published_open", logErrorReason(err), offset, length)
+				return
 			}
 			defer published.Close()
 			if _, err := published.Seek(offset, io.SeekStart); err != nil {
-				panic(http.ErrAbortHandler)
+				abortBlobResponse(ctx, key, f, "published_seek", logErrorReason(err), offset, length)
+				return
 			}
-			if _, err := io.CopyN(w, published, length-offset); err != nil {
-				panic(http.ErrAbortHandler)
+			if n, err := io.CopyN(w, published, length-offset); err != nil {
+				// CopyN can fail on either side. Keep its fast paths and do not
+				// attribute an ambiguous error to storage or the downstream.
+				abortBlobResponse(ctx, key, f, "final_copy", logErrorReason(err), offset+n, length)
 			}
 			return
 		}
@@ -158,9 +198,11 @@ func (c *mirrorCache) serveColdBlob(w http.ResponseWriter, r *http.Request, key 
 		}
 		if err != nil {
 			if offset != 0 {
-				panic(http.ErrAbortHandler)
+				abortBlobResponse(ctx, key, f, "staging_read", logErrorReason(err), offset, length)
+				return
 			}
-			fetchError(w, "blobs", cacheStorageError(err))
+			blobRequestFailed(ctx, key, f, "staging_read", err)
+			writeFetchError(w, "blobs", cacheStorageError(err), false)
 			return
 		}
 		first := offset == 0
@@ -171,13 +213,18 @@ func (c *mirrorCache) serveColdBlob(w http.ResponseWriter, r *http.Request, key 
 			w.Header().Set("Accept-Ranges", "bytes")
 		}
 		n, err := w.Write(chunk)
-		if err != nil || n != len(chunk) {
-			panic(http.ErrAbortHandler)
-		}
 		offset += int64(n)
+		if err != nil || n != len(chunk) {
+			reason := "short_write"
+			if err != nil {
+				reason = logErrorReason(err)
+			}
+			abortBlobResponse(ctx, key, f, "downstream_write", reason, offset, length)
+			return
+		}
 		if first {
 			if err := http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
-				panic(http.ErrAbortHandler)
+				abortBlobResponse(ctx, key, f, "downstream_flush", logErrorReason(err), offset, length)
 			}
 		}
 	}

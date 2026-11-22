@@ -81,49 +81,52 @@ type fallbackPolicy struct {
 	allowed, denied map[string]struct{}
 }
 
-func (p fallbackPolicy) permits(repo resolvedRepository) bool {
+func (p fallbackPolicy) rejection(repo resolvedRepository) string {
 	if _, denied := p.denied[repo.logicalRegistry]; denied {
-		return false
+		return "registry_denied"
 	}
-	_, allowed := p.allowed[repo.logicalRegistry]
-	return len(p.allowed) == 0 || allowed
+	if _, allowed := p.allowed[repo.logicalRegistry]; len(p.allowed) != 0 && !allowed {
+		return "registry_not_allowed"
+	}
+	return ""
 }
 
 // classify runs only after a candidate backend 404. Normalization chooses
 // the upstream without changing the backend's repository name or authority.
-func (p fallbackPolicy) classify(r *http.Request) (readRequest, bool) {
+func (p fallbackPolicy) classify(r *http.Request) (readRequest, string) {
 	if r.URL.RawQuery != "" || r.URL.ForceQuery || r.URL.EscapedPath() != r.URL.Path {
-		return readRequest{}, false
+		return readRequest{}, ""
 	}
 	path, ok := strings.CutPrefix(r.URL.Path, "/v2/")
 	if !ok {
-		return readRequest{}, false
+		return readRequest{}, ""
 	}
 	refSep := strings.LastIndexByte(path, '/')
 	if refSep < 0 {
-		return readRequest{}, false
+		return readRequest{}, ""
 	}
 	kindSep := strings.LastIndexByte(path[:refSep], '/')
 	if kindSep < 0 {
-		return readRequest{}, false
+		return readRequest{}, ""
 	}
 	kind, ref := path[kindSep+1:refSep], path[refSep+1:]
 	switch kind {
 	case "manifests":
 		if (r.Method != http.MethodGet && r.Method != http.MethodHead) ||
 			(!tagPattern.MatchString(ref) && !digestPattern.MatchString(ref)) {
-			return readRequest{}, false
+			return readRequest{}, ""
 		}
 	case "blobs":
 		if r.Method != http.MethodGet || !digestPattern.MatchString(ref) {
-			return readRequest{}, false
+			return readRequest{}, ""
 		}
 	default:
-		return readRequest{}, false
+		return readRequest{}, ""
 	}
 	repo, err := resolveRepository(path[:kindSep])
-	if err != nil || !p.permits(repo) {
-		return readRequest{}, false
+	read := readRequest{kind: kind, reference: ref, repository: repo}
+	if err != nil {
+		return read, "invalid_repository"
 	}
-	return readRequest{kind: kind, reference: ref, repository: repo}, true
+	return read, p.rejection(repo)
 }

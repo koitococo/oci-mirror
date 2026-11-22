@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
@@ -39,27 +40,75 @@ func newBackendTransport() *http.Transport {
 	return transport
 }
 
+type backendTransport struct{ base http.RoundTripper }
+
+func backendLogMethod(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
+		http.MethodDelete, http.MethodOptions, http.MethodConnect, http.MethodTrace:
+		return method
+	default:
+		return "other"
+	}
+}
+
+func (t backendTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.roundTrip(req, "primary")
+}
+
+func (t backendTransport) roundTrip(req *http.Request, source string) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		if source == "primary" && !errors.Is(req.Context().Err(), context.Canceled) {
+			slog.WarnContext(req.Context(), "backend_transport_failed",
+				"request_id", requestID(req.Context()), "method", backendLogMethod(req.Method),
+				"source", source, "response_status", http.StatusBadGateway, "reason", logErrorReason(err))
+		}
+	} else if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+		slog.WarnContext(req.Context(), "backend_response_failed",
+			"request_id", requestID(req.Context()), "method", backendLogMethod(req.Method),
+			"source", source, "backend_status", resp.StatusCode, "reason", "backend_5xx")
+	}
+	return resp, err
+}
+
 func overlay(backend *url.URL, policy fallbackPolicy, cache *mirrorCache, transport http.RoundTripper) http.Handler {
-	return &httputil.ReverseProxy{
-		Transport: transport,
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	observed := backendTransport{base: transport}
+	proxy := &httputil.ReverseProxy{
+		Transport: observed,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(backend)
 			r.Out.Host = r.In.Host
 			r.Out.URL.RawQuery = r.In.URL.RawQuery
 			r.SetXForwarded()
+			r.Out.Header.Set(requestIDHeader, requestID(r.Out.Context()))
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			// Keep the gateway's response ID, not any value returned by the backend.
+			resp.Header.Del(requestIDHeader)
+			resp.Trailer.Del(requestIDHeader)
 			if resp.StatusCode != http.StatusNotFound || resp.Request == nil {
 				return nil
 			}
-			read, ok := policy.classify(resp.Request)
-			if !ok {
+			read, reason := policy.classify(resp.Request)
+			if read.kind == "" {
 				return nil
 			}
-			if trustedBackendMiss(resp, read, transport) {
-				return &backendMiss{read}
+			decision := backendMissDecision{reason: reason}
+			if reason == "" {
+				decision = checkBackendMiss(resp, read, observed)
 			}
-			return nil
+			if decision.reason != "" {
+				decision.logSkipped(resp, read.kind)
+				return nil
+			}
+			slog.DebugContext(resp.Request.Context(), "backend_fallback",
+				"request_id", requestID(resp.Request.Context()), "method", resp.Request.Method,
+				"kind", read.kind, "backend_status", resp.StatusCode)
+			return &backendMiss{read}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			var miss *backendMiss
@@ -67,10 +116,14 @@ func overlay(backend *url.URL, policy fallbackPolicy, cache *mirrorCache, transp
 				cache.serve(w, r, miss.read)
 				return
 			}
-			log.Printf("backend transport failed: %v", err)
 			registryError(w, http.StatusBadGateway, "UNAVAILABLE", "registry backend transport failed")
 		},
 	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := newLogID()
+		w.Header().Set(requestIDHeader, id)
+		proxy.ServeHTTP(w, r.WithContext(withRequestID(r.Context(), id)))
+	})
 }
 
 func run() error {
