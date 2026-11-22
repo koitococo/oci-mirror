@@ -15,10 +15,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	registry "github.com/google/go-containerregistry/pkg/v1/remote/transport"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -41,7 +41,8 @@ type mirrorCache struct {
 	cancel    context.CancelFunc
 	transport http.RoundTripper
 	quota     fetchQuota
-	blobTasks singleflight.Group
+	blobMu    sync.Mutex
+	blobTasks map[cacheKey]*blobFlight
 }
 
 type cacheScope struct {
@@ -74,7 +75,8 @@ func newMirrorCache(ctx context.Context, dir string, transport http.RoundTripper
 	return &mirrorCache{
 		cacheStorage: store,
 		ctx:          ctx, cancel: cancel, transport: transport,
-		quota: fetchQuota{limits: limits, origin: make(map[string]*originUsage)},
+		quota:     fetchQuota{limits: limits, origin: make(map[string]*originUsage)},
+		blobTasks: make(map[cacheKey]*blobFlight),
 	}, nil
 }
 
@@ -236,34 +238,72 @@ func (c *mirrorCache) serveBlob(w http.ResponseWriter, r *http.Request, repo res
 	key := cacheKey{repositoryScope(repo), digest}
 	defer c.blobs.pin(key)()
 	f, err := c.blobs.open(r.Context(), key)
-	if errors.Is(err, os.ErrNotExist) {
-		taskKey := key.downstream + "\x00" + key.source + "\x00" + digest
-		task := c.blobTasks.DoChan(taskKey, func() (any, error) {
-			return nil, c.downloadBlob(repo, key)
-		})
-		select {
-		case <-r.Context().Done():
-			return
-		case result := <-task:
-			if result.Err != nil {
-				fetchError(w, "blobs", result.Err)
-				return
-			}
-		}
-		f, err = c.blobs.open(r.Context(), key)
+	if err == nil {
+		serveVerifiedBlob(w, r, digest, f)
+		return
 	}
+	if !errors.Is(err, os.ErrNotExist) {
+		registryError(w, http.StatusInternalServerError, "UNKNOWN", "cannot open verified blob")
+		return
+	}
+	flight := c.joinBlobFlight(repo, key)
+	if earlyBlobGET(r) {
+		c.serveColdBlob(w, r, key, flight)
+		return
+	}
+	if err := flight.wait(r.Context()); err != nil {
+		if r.Context().Err() == nil {
+			fetchError(w, "blobs", err)
+		}
+		return
+	}
+	c.servePublishedBlob(w, r, key)
+}
+
+func (c *mirrorCache) joinBlobFlight(repo resolvedRepository, key cacheKey) *blobFlight {
+	c.blobMu.Lock()
+	defer c.blobMu.Unlock()
+	if flight := c.blobTasks[key]; flight != nil {
+		return flight
+	}
+	flight := newBlobFlight()
+	c.blobTasks[key] = flight
+	go func() {
+		unpin := c.blobs.pin(key)
+		defer unpin()
+		err := c.downloadBlob(repo, key, flight)
+		// Staging is closed and quotas are released. Retire the flight before
+		// notifying waiters so an immediate retry cannot join a failed flight.
+		c.blobMu.Lock()
+		delete(c.blobTasks, key)
+		flight.finish(err)
+		c.blobMu.Unlock()
+	}()
+	return flight
+}
+
+func (c *mirrorCache) servePublishedBlob(w http.ResponseWriter, r *http.Request, key cacheKey) {
+	f, err := c.blobs.open(r.Context(), key)
 	if err != nil {
 		registryError(w, http.StatusInternalServerError, "UNKNOWN", "cannot open verified blob")
 		return
 	}
-	defer f.Close()
+	serveVerifiedBlob(w, r, key.reference, f)
+}
+
+func setBlobHeaders(w http.ResponseWriter, digest string) {
 	w.Header().Set("Docker-Content-Digest", digest)
 	w.Header().Set("ETag", `"`+digest+`"`)
 	w.Header().Set("Content-Type", "application/octet-stream")
+}
+
+func serveVerifiedBlob(w http.ResponseWriter, r *http.Request, digest string, f *os.File) {
+	defer f.Close()
+	setBlobHeaders(w, digest)
 	http.ServeContent(w, r, digest, time.Time{}, f)
 }
 
-func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey) error {
+func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey, flight *blobFlight) (result error) {
 	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Minute)
 	defer cancel()
 	f, err := c.blobs.open(ctx, key)
@@ -316,7 +356,25 @@ func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey) error 
 		return cacheStorageError(err)
 	}
 	defer os.Remove(file.Name())
-	n, err := copyVerifiedBlob(file, resp.Body, key.reference, limit, known)
+	// Close the shared staging reader before removing the stage and releasing
+	// its reservation. No downstream network write holds that descriptor.
+	defer func() {
+		if result != nil {
+			log.Printf("mirror staged blob failed digest=%s error_type=%T", key.reference, result)
+		}
+		flight.closeStaging()
+	}()
+	var progress io.Writer
+	if known && expected > 1 {
+		reader, err := os.Open(file.Name())
+		if err != nil {
+			_ = file.Close()
+			return cacheStorageError(err)
+		}
+		flight.startStreaming(reader, expected)
+		progress = blobProgress{flight}
+	}
+	n, err := copyVerifiedBlob(file, resp.Body, key.reference, limit, known, progress)
 	if err != nil {
 		_ = file.Close()
 		return err
@@ -336,9 +394,21 @@ func (c *mirrorCache) downloadBlob(repo resolvedRepository, key cacheKey) error 
 	return nil
 }
 
-func copyVerifiedBlob(file *os.File, body io.Reader, digest string, limit int64, exact bool) (int64, error) {
+type blobProgress struct{ flight *blobFlight }
+
+func (p blobProgress) Write(data []byte) (int, error) {
+	p.flight.advance(len(data))
+	return len(data), nil
+}
+
+func copyVerifiedBlob(file *os.File, body io.Reader, digest string, limit int64, exact bool, progress io.Writer) (int64, error) {
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(file, h), io.LimitReader(body, limit))
+	writers := [3]io.Writer{file, h, progress}
+	count := 2
+	if progress != nil {
+		count++
+	}
+	n, err := io.Copy(io.MultiWriter(writers[:count]...), io.LimitReader(body, limit))
 	if err != nil {
 		var pathError *os.PathError
 		if errors.As(err, &pathError) {

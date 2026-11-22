@@ -25,13 +25,13 @@ Mirror 验证 Registry Bearer JWT 的 RSA RS256 签名、`iss`、`aud`、`exp`�
 | 0002 §3：同名覆盖 | 新 Push 提交后，下一次 Tag 读取优先返回 Zot；按公网旧 digest 读取不转成 Tag 查找。删除本地 Tag 后可再次露出 Mirror 固定版本，不建立屏蔽记录。 |
 | 0002 §1、§4、[0001](../.omp/specs/0001-lazy-mirror.md) §3、§6：回源 | 用 [Distribution reference](https://pkg.go.dev/github.com/distribution/reference#ParseNormalizedNamed) 规范化上游。Docker Hub 补 `library/` 并访问 `registry-1.docker.io`；显式仓库可动态回源，短名需逐个批准。逻辑 Registry 的 deny 优先于 allow；这些规则不代替 realm/CDN 的 TLS 与拨号地址校验。Mirror 用 go-containerregistry 完成匿名 Bearer 握手，不用客户端入站凭据回源。 |
 | 0001 §4：Manifest | 按请求独立获取原始 Manifest，不拉取 config、层或 Index 的子 Manifest。支持 OCI Image Manifest / Image Index 与 Docker schema 2 Manifest / Manifest List。Tag 和 digest 绑定持久化；已固定的 Tag 不随公网更新而刷新。 |
-| 0002 §5、0001 §2.2：Blob | 一次冷读只按 digest 下载请求的 Blob；同一 Blob 的并发冷读可合并。完整内容经 SHA-256 校验、发布到磁盘后才提供给客户端。冷 `Range` 同样先取并校验整个 Blob，再从本地文件服务 `206` 或 `416`。 |
+| 0002 §5、0001 §2.2：Blob | 一次冷读只下载目标 digest，并发读者共用同一个生产者。可信长度的完整冷 GET 可以读取正在写入的暂存前缀；末尾至少一字节在验证和发布后发送。冷 Range 等整块校验发布后才从正式缓存返回 `206` 或 `416`。 |
 
 冷获取的 Manifest 上限为 4 MiB、30 秒，Blob 上限为 2 GiB、10 分钟。固定 Tag 不等于所有依赖都已离线可读。
 
 规范化不改变 Zot 仓库、JWT scope 或覆盖 Tag。缓存同时按下游原仓库名和规范化上游来源隔离；`alpine`、`library/alpine`、`docker.io/library/alpine` 即使同指一个上游，也各自持有缓存。Tag 省略时由 OCI 客户端请求 `latest`；协议层仍要求有效 Tag 或 SHA-256 digest。
 
-改动入口：[`main.go`](../cmd/oci-mirror/main.go) 保留 Zot 转发和回退判断；[`resolver.go`](../cmd/oci-mirror/resolver.go) 负责引用规范化和回退策略；[`upstream.go`](../cmd/oci-mirror/upstream.go) 封装匿名上游与出站策略；[`cache.go`](../cmd/oci-mirror/cache.go) 负责 Manifest 固定、Blob 下载和校验发布。
+改动入口：[`main.go`](../cmd/oci-mirror/main.go) 保留 Zot 转发和回退判断；[`resolver.go`](../cmd/oci-mirror/resolver.go) 负责引用规范化和回退策略；[`upstream.go`](../cmd/oci-mirror/upstream.go) 封装匿名上游与出站策略；[`cache.go`](../cmd/oci-mirror/cache.go) 负责 Manifest 固定、Blob 下载和校验发布；[`blobstream.go`](../cmd/oci-mirror/blobstream.go) 负责并发读者的暂存出流和响应中止。
 
 ### 持久缓存与配额
 
@@ -69,6 +69,18 @@ Manifest 固定记录不淘汰；额度不足时新增绑定返回 `507`。Blob 
 缩小配额后，实测 Blob 按字节及条目上限分别淘汰，Manifest 固定记录不受影响；超出 Manifest 或 staging 配额返回 `507`。原已发布 Blob 被截断后返回 `500` 而不重新回源，另一个上游仓库不存在同一 digest 时仍返回 `404`。独立的压力场景也验证了全局/每上游的并发与暂存限制、活动读者不被回收、并发发布只保留同一份 Tag 绑定。
 
 留存的 Mirror 已切换到新版持久缓存；本机 Docker Engine 通过 JWT/TLS 拉取 `registry.k8s.io/pause:3.10`，本机 Skopeo 完整拉取 `r.ltkk.run/library/alpine:latest` 并核对镜像层摘要。Zot、docker-auth 和旧版缓存目录均保留。
+
+### 完整冷 Blob GET 提前出流
+
+已授权且 Zot 真实缺失后，Mirror 按仓库、源和 digest 合并任务。单个后台生产者顺序读取上游、写一个暂存文件并增量计算 SHA-256；读取方通过各自的偏移读取已写入的内容，网络慢读和断连不控制生产者。暂存仍受原有的全局、每上游和单对象额度限制。
+
+仅无 Range 或 HTTP 条件头、且总长可信的完整 GET 可提前出流。总长优先取已固定的 Manifest 描述符，并核对可用的上游 `Content-Length`；没有描述符时可用上游 `Content-Length`。长度未知或没有可提前发送的前缀时，先等待正式发布。提前出流带总 `Content-Length`，已发前缀未经整块验证；只有读到 HTTP 响应体结束、长度和 SHA-256 匹配且目录发布成功，才从正式缓存发送剩余字节。失败若发生在首字节之前，返回普通 Registry 错误；若已出流，则中止传输，不发送尾字节或追加 JSON。
+
+冷 Range、条件请求只读正式发布的文件；热 GET 与 Blob HEAD 的分流不变。Nginx 入口应禁用 `/v2/` 的响应缓冲，或保留对 `X-Accel-Buffering: no` 的默认处理，避免缓存层或代理层吞掉提前出流的延迟收益。
+
+**实测：** 用 1,073,754,169 字节的受控 Blob 验证客户端在上游未结束时已收到前缀；分别阻塞 EOF 和正式发布，最后一字节始终未发送。快慢读者和冷 Range 共用一次回源；所有客户端断开后，任务仍完成校验并发布。短读、超长、摘要错误和发布失败均中止已开始的 HTTP 响应，未留正式缓存，下一次请求可重试。未知总长等发布后才响应；冷、在途和已缓存三个状态的 Blob HEAD 均只得到 Zot 的结果。
+
+保留的 JWT/TLS 环境已切到新版，仍使用同一个持久缓存目录。本机 Docker Engine 冷拉 `quay.io/libpod/alpine:latest`，本机 Skopeo 冷拉 `quay.io/libpod/busybox:latest` 并验证层摘要；Zot、docker-auth 和 Nginx 均保留。
 
 ## Smoke：按阶段执行
 
@@ -347,5 +359,5 @@ docker run --rm --network "$JWT_NETWORK" --add-host "$JWT_HOST:$JWT_IP" \
 
 1. **部署验证。** P0 的信任边界仅涵盖上面限定的专用 Zot 和传统 Registry Bearer JWT，不支持通用 OIDC、权限隐藏型后端、集群或远端同步。对外开放前按实际签发策略和目标版本复核错误 issuer/audience/scope、过期 token、权限隐藏和后端故障均不能触发回退；确认入站凭据不进入公网请求。
 2. **多上游调度。** 现有配额限制全局与每个逻辑 Registry 的并发及暂存；尚无更细的速率策略或有界、可复用的 Bearer 上下文。
-3. **传输优化。** 补齐 0002 §5.1 的完整冷 GET 提前出流、末尾字节保留与响应中止语义，再实现 §5.2 的上游 Range 续传，并以大 Blob、故障注入、读者断开和慢读者场景验证。PoC 不提前发前缀、不续传、不分片。
+3. **续传。** 0002 §5.1 的完整冷 GET 已支持提前出流。上游中断仍结束当前任务，暂不支持 §5.2 的鉴别后 Range 续传，也不做分片或并行下载。
 4. **上线验收。** 本文的验收只针对宿主机 Docker 与 Skopeo，不代表其它客户端或完整多架构矩阵。若客户端依赖 Blob HEAD `200` 才能 Pull，不能靠伪造成功响应通过验收。
