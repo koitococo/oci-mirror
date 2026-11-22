@@ -11,13 +11,13 @@ services:
   mirror:
     image: ${OCI_MIRROR_IMAGE:-oci-mirror:local}
     build: .
-    # Mirror only listens on loopback; Linux host networking exposes that loopback.
-    network_mode: host
+    ports:
+      - "127.0.0.1:15000:15000"
     depends_on:
       - registry
     command:
-      - -listen=127.0.0.1:15000
-      - -backend=http://127.0.0.1:15001
+      - -listen=0.0.0.0:15000
+      - -backend=http://registry:5000
       - -cache-dir=/var/lib/oci-mirror/cache
     volumes:
       - mirror-cache:/var/lib/oci-mirror/cache

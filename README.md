@@ -6,7 +6,7 @@
 
 同一个引用（例如 `mirror-poc.test:15443/registry.k8s.io/pause:3.10`）可以先从公网 Pull，再由正常 Push 写入 Zot 并覆盖该 Tag。删除 Zot 的覆盖后，入口重新返回 Mirror 固定的公网版本。Mirror 缓存不写入 Zot，也不会让 Push 误以为 Zot 已有某个 Blob。
 
-`-backend` 指定受操作者信任的私有 HTTP/HTTPS Registry origin（可使用 IP 或 DNS 名称；非回环连接应使用 HTTPS），`-cache-dir` 必填，`-listen` 只接受 IP 字面量形式的回环地址和端口。后端可使用符合下述契约的 Zot 或 Distribution。客户端连接受信任的 HTTPS 入口；Mirror 原样转发正常的 `/v2/` 探测与具体资源请求的 `Authorization`，并透传后端认证挑战。Mirror 不配置认证、不读取 JWT 证书或 issuer，也不会把 `/v2/` 成功当作具体仓库的拉取授权。
+`-backend` 指定受操作者信任的私有 HTTP/HTTPS Registry origin（可使用 IP 或 DNS 名称；在可信容器网络以外应使用 HTTPS），`-cache-dir` 必填。`-listen` 接受 IP 字面量和端口，默认 `127.0.0.1:15000`；在独立的 Docker 网络中可显式绑定 `0.0.0.0:15000`，由 ingress 访问而不发布宿主机端口。后端可使用符合下述契约的 Zot 或 Distribution。客户端连接受信任的 HTTPS 入口；Mirror 原样转发正常的 `/v2/` 探测与具体资源请求的 `Authorization`，并透传后端认证挑战。Mirror 不配置认证、不读取 JWT 证书或 issuer，也不会把 `/v2/` 成功当作具体仓库的拉取授权。
 
 后端是本地存储和写入的权威：须先执行具体资源的鉴权再查找，不得把拒绝或故障伪装成类型化缺失。使用本地优先语义时，不能启用后端自身的代理缓存（如 Distribution proxy 或 Zot Sync）。Mirror 不用缓存代替后端上传检查，也不重写 `Location`；Distribution 应配置 `http.relativeurls: true` 或将 `http.host` 指向客户端可达的公开入口。
 
@@ -24,7 +24,7 @@ curl -fsS --retry 10 --retry-all-errors http://127.0.0.1:15000/v2/
 
 Bake 通过 [Dockerfile](Dockerfile) 构建镜像，默认标签为 `oci-mirror:local`。可在构建和启动前用 `OCI_MIRROR_IMAGE` 覆盖标签，也可以直接用 `docker compose up -d --build`。
 
-[Compose 示例](compose.yaml) 启动 Mirror 和 Distribution 3.1.2。Mirror 使用 Linux host 网络以满足回环监听要求，入口为 `127.0.0.1:15000`，后端只发布到 `127.0.0.1:15001`。两者各用独立的命名卷；`docker compose down` 保留数据。该示例使用无认证的本机 HTTP，不应直接开放到其他机器；需要对外提供服务时，使用 HTTPS 入口和有认证的后端。
+[Compose 示例](compose.yaml) 在独立的 Docker 网络里启动 Mirror 和 Distribution 3.1.2，按服务名直连后端。Mirror 和 Registry 分别只发布到宿主机的 `127.0.0.1:15000` 和 `127.0.0.1:15001`，各用独立的命名卷；`docker compose down` 保留数据。该示例使用无认证的本机 HTTP，不应直接开放到其他机器；需要对外提供服务时，使用 HTTPS 入口和有认证的后端。
 
 可用 Skopeo 验证真实回源（`--src-tls-verify=false` 仅用于这个回环 HTTP 示例）：
 

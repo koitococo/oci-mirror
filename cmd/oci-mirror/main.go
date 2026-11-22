@@ -127,7 +127,7 @@ func overlay(backend *url.URL, policy fallbackPolicy, cache *mirrorCache, transp
 }
 
 func run() error {
-	listen := flag.String("listen", "127.0.0.1:15000", "loopback listen address")
+	listen := flag.String("listen", "127.0.0.1:15000", "listen IP address and port (defaults to loopback)")
 	backendURL := flag.String("backend", "", "local-only Registry V2 HTTP or HTTPS origin (required)")
 	cacheDir := flag.String("cache-dir", "", "directory for the persistent Mirror cache (required)")
 	limits := cacheLimitFlags()
@@ -151,8 +151,8 @@ func run() error {
 	})
 	flag.Parse()
 
-	if addr, err := netip.ParseAddrPort(*listen); err != nil || !addr.Addr().IsLoopback() {
-		return errors.New("-listen must be a numeric loopback address with port")
+	if _, err := netip.ParseAddrPort(*listen); err != nil {
+		return errors.New("-listen must be an IP address with port")
 	}
 	backend, err := url.Parse(*backendURL)
 	if err != nil || (backend.Scheme != "http" && backend.Scheme != "https") || backend.Hostname() == "" ||
