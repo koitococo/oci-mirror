@@ -81,7 +81,7 @@ func openCacheStorage(ctx context.Context, dir string, limits cacheLimits) (_ *c
 	if err := os.Mkdir(store.staging, 0700); err != nil {
 		return nil, err
 	}
-	store.blobs, err = newBlobStore(ctx, store.db, blobsPath, limits.blobBytes, limits.blobEntries)
+	store.blobs, err = newBlobStore(ctx, store.db, blobsPath, limits)
 	if err != nil {
 		return nil, fmt.Errorf("open Blob catalog: %w", err)
 	}

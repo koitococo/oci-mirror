@@ -48,31 +48,42 @@ Zot 的 HTTP Basic 可由 `http.auth.htpasswd.path` 与可选的 `http.accessCon
 
 `-cache-dir` 必填。每个 Mirror 进程使用一个专用的本地持久目录，不与其他进程共享。`<cache-dir>/mirror-v1/catalog.sqlite` 使用 SQLite WAL 与 `synchronous=FULL`，记录不可变的原始 Manifest 字节、上游来源与下游仓库、Tag 和 digest 绑定、Blob 描述符长度及已发布的 Blob 记录。`mirror-v1/staging/` 存放下载中的临时文件，`mirror-v1/blobs/` 存放已校验发布的 Blob。
 
-重启恢复 Manifest 绑定、可用的新鲜度标记与已发布的 Blob，清理中断的暂存文件及孤立 Blob 文件，并按调低后的 Blob 配额淘汰载荷，不修剪 Manifest 记录。已初始化的缓存丢失目录数据库时启动失败，不会静默创建新库。旧布局在 `mirror-v1/` 旁的缓存文件不会被读取、迁移或删除。
+重启恢复 Manifest 绑定、可用的新鲜度标记与已发布的 Blob，清理中断的暂存文件及孤立 Blob 文件（不受 Blob TTL 约束），并按下文的软水位尽力回收 Blob，不修剪 Manifest 记录。已初始化的缓存丢失目录数据库时启动失败，不会静默创建新库。旧布局在 `mirror-v1/` 旁的缓存文件不会被读取、迁移或删除。
 
-除 TTL 外，下列参数均须为正数；字节参数传十进制整数：
+字节参数传十进制整数。TTL 和 Blob 软水位接受 `0`，其余配额参数须为正数。
 
 | 参数 | 默认 | 计量对象 |
 | --- | ---: | --- |
 | `-cache-manifest-ttl` | `0` | Manifest 缓存有效期（Go duration，如 `30m`）；`0` 关闭，负值报错 |
 | `-cache-manifest-bytes` | 64 MiB | 保留的原始 Manifest 字节 |
 | `-cache-manifest-entries` | 10000 | digest 记录与 Tag 绑定合计 |
-| `-cache-blob-bytes` | 16 GiB | 已发布的 Blob 载荷 |
-| `-cache-blob-entries` | 10000 | 已发布的 Blob 记录 |
+| `-cache-blob-bytes` | 16 GiB | 已发布 Blob 载荷字节硬限额 |
+| `-cache-blob-entries` | 10000 | 已发布 Blob 记录数硬限额 |
+| `-cache-blob-soft-bytes` | `0` | Blob 载荷字节回收目标；`0` 等于对应硬限额 |
+| `-cache-blob-soft-entries` | `0` | Blob 记录数回收目标；`0` 等于对应硬限额 |
+| `-cache-blob-ttl` | `0` | Blob 发布后的防淘汰期（Go duration，如 `30m`）；`0` 不保护，负值报错 |
 | `-cache-staging-bytes` | 8 GiB | 全局 Blob 暂存预留 |
 | `-cache-upstream-staging-bytes` | 4 GiB | 每个逻辑 Registry 的 Blob 暂存预留 |
 | `-cache-fetches` | 4 | 全局并行回源请求（含 Manifest 刷新） |
 | `-cache-upstream-fetches` | 2 | 每个逻辑 Registry 的并行回源请求（含 Manifest 刷新） |
 
-例如，以下参数可用于指定缓存目录并限制 Blob 容量，前提是专用目录已由运维人员准备且运行用户可写：
+例如，以下参数将 Blob 的字节软水位设为 6 GiB、硬限额设为 8 GiB，记录数软硬限额均为 5000，并设置 30 分钟的防淘汰期。专用目录须由运维人员准备且运行用户可写：
 
 ```text
--cache-dir /var/lib/oci-mirror/cache -cache-blob-bytes 8589934592 -cache-blob-entries 5000
+-cache-dir /var/lib/oci-mirror/cache -cache-blob-bytes 8589934592 -cache-blob-entries 5000 -cache-blob-soft-bytes 6442450944 -cache-blob-ttl 30m
 ```
 
 并发槽由需要回源的 Manifest（包括刷新）和冷 Blob 请求共用；每上游配额按逻辑 Registry 计量，Docker Hub 别名共用配额，但不同 Registry 的小请求可在全局额度内并发。Blob 写入暂存前按已知预期长度预留空间，长度未知时按有上限的单对象额度预留。已知长度超出配额或剩余配额不足返回 `507`，回源槽用尽返回 `503`，目录中已有 Blob 发布记录但文件缺失或长度不符返回 `500`。
 
-Manifest 记录不淘汰；Tag 刷新不会删除旧 digest，旧记录仍计入配额，额度不足时新增 digest 或绑定返回 `507`。Blob 淘汰采用近似 LRU，跳过正在读取的载荷，最近访问时间按一秒粒度更新。已发布载荷预算不含 SQLite 元数据、WAL、新鲜度标记、暂存和旧布局文件；这些参数不是物理磁盘用量的硬上限。需要硬上限时另设文件系统配额，并为这些额外开销留出空间。
+Manifest 记录不淘汰；Tag 刷新不会删除旧 digest，旧记录仍计入配额，额度不足时新增 digest 或绑定返回 `507`。Blob 载荷字节预算不含 SQLite 元数据、WAL、新鲜度标记、暂存和旧布局文件；这些参数不是物理磁盘用量的硬上限。需要硬上限时另设文件系统配额，并为这些额外开销留出空间。
+
+#### Blob TTL 与软水位
+
+`-cache-blob-ttl` 从已发布 Blob 文件的 `stat` `ctime`（inode 变更时间）起算。读命中不续期，重启不重置。到期只使 Blob 有资格参与淘汰，不会主动删除。每项软水位均不得为负或超过对应硬限额；`0` 分别继承对应硬限额。
+
+启动和新 Blob 发布时，Mirror 按近似 LRU 尽力回收到两个软水位，跳过正在读取和仍受 TTL 保护的 Blob；最近访问时间按一秒粒度更新。没有定时回收；若未达目标，下次启动或发布时再尝试。
+
+即使未达软水位，只要加入新 Blob 后仍在两个硬限额内，就允许发布。清理可回收项后仍会超过任一硬限额时，不会破坏保护来腾出空间，而是拒绝新发布：未提前出流的请求返回配额错误 `507`，已提前出流的响应截断。调低硬限额后，启动时若因 TTL 保护仍超额，Mirror 仍可启动并读取旧 Blob，但会拒绝仍会超出硬限额的新发布。上述策略不影响暂存、孤立文件的启动清理或 Manifest 缓存。
 
 #### Manifest TTL
 

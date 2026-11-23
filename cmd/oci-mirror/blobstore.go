@@ -13,13 +13,16 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type blobStore struct {
-	db         *sql.DB
-	root       string
-	maxBytes   int64
-	maxEntries int
+	db                      *sql.DB
+	root                    string
+	maxBytes, softBytes     int64
+	maxEntries, softEntries int
+	ttl                     time.Duration
 
 	mu          sync.Mutex
 	pins        map[cacheKey]int
@@ -30,8 +33,8 @@ type blobStore struct {
 	publicationErr error
 }
 
-func newBlobStore(ctx context.Context, db *sql.DB, root string, maxBytes int64, maxEntries int) (*blobStore, error) {
-	if err := os.MkdirAll(root, 0700); err != nil {
+func newBlobStore(ctx context.Context, db *sql.DB, root string, limits cacheLimits) (*blobStore, error) {
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("create blob root: %w", err)
 	}
 	if err := syncBlobDir(filepath.Dir(root)); err != nil {
@@ -48,11 +51,22 @@ func newBlobStore(ctx context.Context, db *sql.DB, root string, maxBytes int64, 
 	CREATE INDEX IF NOT EXISTS blobs_accessed ON blobs (accessed, downstream, source, digest);`); err != nil {
 		return nil, fmt.Errorf("initialize blob catalog: %w", err)
 	}
-	s := &blobStore{db: db, root: root, maxBytes: maxBytes, maxEntries: maxEntries, pins: make(map[cacheKey]int)}
+	softBytes, softEntries := limits.blobSoftBytes, limits.blobSoftEntries
+	if softBytes == 0 {
+		softBytes = limits.blobBytes
+	}
+	if softEntries == 0 {
+		softEntries = limits.blobEntries
+	}
+	s := &blobStore{
+		db: db, root: root, pins: make(map[cacheKey]int), ttl: limits.blobTTL,
+		maxBytes: limits.blobBytes, maxEntries: limits.blobEntries,
+		softBytes: softBytes, softEntries: softEntries,
+	}
 	if err := s.pruneOrphans(ctx); err != nil {
 		return nil, fmt.Errorf("prune blob store: %w", err)
 	}
-	if err := s.trimTo(ctx, maxBytes, maxEntries); err != nil {
+	if err := s.trim(ctx, 0, 0); err != nil {
 		return nil, fmt.Errorf("reconcile blob quota: %w", err)
 	}
 	return s, nil
@@ -161,7 +175,7 @@ func (s *blobStore) publish(ctx context.Context, key cacheKey, stage string, siz
 	if s.maxEntries < 1 {
 		return quotaLimit(errCacheFull, "cache-blob-entries")
 	}
-	if err := s.trimTo(ctx, s.maxBytes-size, s.maxEntries-1); err != nil {
+	if err := s.trim(ctx, size, 1); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -194,10 +208,14 @@ func (s *blobStore) publish(ctx context.Context, key cacheKey, stage string, siz
 	return nil
 }
 
-func (s *blobStore) trimTo(ctx context.Context, maxBytes int64, maxEntries int) error {
-	freeBytes := s.usedBytes - maxBytes
-	freeEntries := s.usedEntries - maxEntries
-	if freeBytes <= 0 && freeEntries <= 0 {
+// trim targets the soft limits. A publication reserves room for its payload
+// and record; startup makes a best-effort pass even if protected usage exceeds
+// the hard limits after a configuration change.
+func (s *blobStore) trim(ctx context.Context, reserveBytes int64, reserveEntries int) error {
+	targetBytes := max(s.softBytes-reserveBytes, 0)
+	targetEntries := s.softEntries - reserveEntries
+	remainingBytes, remainingEntries := s.usedBytes, s.usedEntries
+	if remainingBytes <= targetBytes && remainingEntries <= targetEntries {
 		return nil
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT downstream, source, digest, size FROM blobs ORDER BY accessed, downstream, source, digest`)
@@ -210,7 +228,8 @@ func (s *blobStore) trimTo(ctx context.Context, maxBytes int64, maxEntries int) 
 		size int64
 	}
 	var victims []victim
-	for (freeBytes > 0 || freeEntries > 0) && rows.Next() {
+	cutoff := time.Now().Add(-s.ttl)
+	for (remainingBytes > targetBytes || remainingEntries > targetEntries) && rows.Next() {
 		var v victim
 		if err := rows.Scan(&v.key.downstream, &v.key.source, &v.key.reference, &v.size); err != nil {
 			return fmt.Errorf("read blob eviction candidate: %w", err)
@@ -218,9 +237,19 @@ func (s *blobStore) trimTo(ctx context.Context, maxBytes int64, maxEntries int) 
 		if s.pins[v.key] != 0 {
 			continue
 		}
+		if s.ttl > 0 {
+			var stat unix.Stat_t
+			path := s.path(v.key)
+			if err := unix.Stat(path, &stat); err != nil {
+				return fmt.Errorf("stat Blob TTL for %q: %w", path, err)
+			}
+			if time.Unix(stat.Ctim.Unix()).After(cutoff) {
+				continue
+			}
+		}
 		victims = append(victims, v)
-		freeBytes -= v.size
-		freeEntries--
+		remainingBytes -= v.size
+		remainingEntries--
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("scan blob eviction candidates: %w", err)
@@ -229,11 +258,13 @@ func (s *blobStore) trimTo(ctx context.Context, maxBytes int64, maxEntries int) 
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("close blob eviction candidates: %w", err)
 	}
-	if freeBytes > 0 {
-		return quotaLimit(errCacheFull, "cache-blob-bytes")
-	}
-	if freeEntries > 0 {
-		return quotaLimit(errCacheFull, "cache-blob-entries")
+	if reserveEntries != 0 {
+		if remainingBytes > s.maxBytes-reserveBytes {
+			return quotaLimit(errCacheFull, "cache-blob-bytes")
+		}
+		if remainingEntries > s.maxEntries-reserveEntries {
+			return quotaLimit(errCacheFull, "cache-blob-entries")
+		}
 	}
 	for _, v := range victims {
 		if err := s.evict(ctx, v.key, v.size); err != nil {

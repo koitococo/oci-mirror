@@ -200,7 +200,9 @@ services:
 
 ## 持久缓存
 
-将必填的 `-cache-dir` 指向本机专用持久目录，只交给一个 Mirror 进程使用。重启会恢复 Manifest 和 Tag 绑定。`-cache-manifest-ttl` 接受 Go duration（如 `30m`），默认 `0`，不刷新已缓存的 Tag；启用后，Zot 可信缺失且允许回退时，过期的 Tag 或 digest 请求必须重新回源，失败不返回旧清单。Blob 仍可按容量淘汰，缓存了 Manifest 不保证依赖全部可离线读取。新布局不读取、不迁移也不删除旧缓存文件。[目录布局、配额参数和运维限制](docs/poc.md#持久缓存与配额)。
+将必填的 `-cache-dir` 指向本机专用持久目录，只交给一个 Mirror 进程使用。重启会恢复 Manifest 和 Tag 绑定。`-cache-manifest-ttl` 接受 Go duration（如 `30m`），默认 `0`，不刷新已缓存的 Tag；启用后，Zot 可信缺失且允许回退时，过期的 Tag 或 digest 请求必须重新回源，失败不返回旧清单。缓存了 Manifest 不保证依赖全部可离线读取。新布局不读取、不迁移也不删除旧缓存文件。
+
+`-cache-blob-ttl` 默认 `0`（不保护）；设为 Go duration 可从 Blob 发布起暂时保护其不被配额淘汰，读命中不续期，重启不重置。到期只意味着可以被淘汰，不会主动删除。Mirror 在启动和发布新 Blob 时尽力回收到 `-cache-blob-soft-bytes` 和 `-cache-blob-soft-entries`（默认各等于对应硬限额），跳过正在读取和受 TTL 保护的 Blob。未达软水位仍可发布，只要不超过 `-cache-blob-bytes` 和 `-cache-blob-entries`；否则拒绝发布，未开始出流时返回 `507`，已出流时截断。[目录布局、配额参数和运维限制](docs/poc.md#持久缓存与配额)。
 
 长度可信的完整冷 Blob GET 可以提前收到前缀；末尾至少一字节只会在校验和正式发布成功后发送。Range 和条件请求仍等正式缓存。前置代理须关闭 Registry 响应缓冲，或尊重 Mirror 的 `X-Accel-Buffering: no`；上面的 Nginx 示例已关闭 `/v2/` 的缓冲。
 

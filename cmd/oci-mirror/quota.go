@@ -27,9 +27,11 @@ func quotaLimit(err error, dimension string) error {
 type cacheLimits struct {
 	manifestBytes, blobBytes           int64
 	manifestEntries, blobEntries       int
+	blobSoftBytes                      int64
+	blobSoftEntries                    int
 	stagingBytes, upstreamStagingBytes int64
 	fetches, upstreamFetches           int
-	manifestTTL                        time.Duration
+	manifestTTL, blobTTL               time.Duration
 }
 
 func cacheLimitFlags() *cacheLimits {
@@ -37,8 +39,11 @@ func cacheLimitFlags() *cacheLimits {
 	flag.Int64Var(&l.manifestBytes, "cache-manifest-bytes", 64<<20, "total pinned Manifest payload bytes")
 	flag.IntVar(&l.manifestEntries, "cache-manifest-entries", 10000, "total Manifest digest records and Tag bindings")
 	flag.DurationVar(&l.manifestTTL, "cache-manifest-ttl", 0, "maximum Manifest freshness before fetching upstream again (0 disables expiration)")
-	flag.Int64Var(&l.blobBytes, "cache-blob-bytes", 16<<30, "total published Blob payload bytes")
-	flag.IntVar(&l.blobEntries, "cache-blob-entries", 10000, "total published Blob records")
+	flag.Int64Var(&l.blobBytes, "cache-blob-bytes", 16<<30, "hard limit on published Blob payload bytes")
+	flag.IntVar(&l.blobEntries, "cache-blob-entries", 10000, "hard limit on published Blob records")
+	flag.Int64Var(&l.blobSoftBytes, "cache-blob-soft-bytes", 0, "Blob byte eviction target (0 uses the hard limit)")
+	flag.IntVar(&l.blobSoftEntries, "cache-blob-soft-entries", 0, "Blob record eviction target (0 uses the hard limit)")
+	flag.DurationVar(&l.blobTTL, "cache-blob-ttl", 0, "protect newly published Blobs from eviction for this duration (0 disables protection)")
 	flag.Int64Var(&l.stagingBytes, "cache-staging-bytes", 8<<30, "global simultaneous Blob staging bytes")
 	flag.Int64Var(&l.upstreamStagingBytes, "cache-upstream-staging-bytes", 4<<30, "Blob staging bytes per logical upstream registry")
 	flag.IntVar(&l.fetches, "cache-fetches", 4, "maximum simultaneous cold requests")
@@ -53,6 +58,15 @@ func (l cacheLimits) validate() error {
 	}
 	if l.manifestTTL < 0 {
 		return errors.New("cache-manifest-ttl must not be negative")
+	}
+	if l.blobTTL < 0 {
+		return errors.New("cache-blob-ttl must not be negative")
+	}
+	if l.blobSoftBytes < 0 || l.blobSoftBytes > l.blobBytes {
+		return errors.New("cache-blob-soft-bytes must be between 0 and cache-blob-bytes")
+	}
+	if l.blobSoftEntries < 0 || l.blobSoftEntries > l.blobEntries {
+		return errors.New("cache-blob-soft-entries must be between 0 and cache-blob-entries")
 	}
 	return nil
 }
