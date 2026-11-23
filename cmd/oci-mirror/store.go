@@ -37,10 +37,10 @@ func openCacheStorage(ctx context.Context, dir string, limits cacheLimits) (_ *c
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(root, 0700); err != nil {
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
-	lock, err := os.OpenFile(filepath.Join(root, ".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	lock, err := os.OpenFile(filepath.Join(root, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +78,7 @@ func openCacheStorage(ctx context.Context, dir string, limits cacheLimits) (_ *c
 	if err := os.RemoveAll(store.staging); err != nil {
 		return nil, fmt.Errorf("reap interrupted Blob staging: %w", err)
 	}
-	if err := os.Mkdir(store.staging, 0700); err != nil {
+	if err := os.Mkdir(store.staging, 0o700); err != nil {
 		return nil, err
 	}
 	store.blobs, err = newBlobStore(ctx, store.db, blobsPath, limits)

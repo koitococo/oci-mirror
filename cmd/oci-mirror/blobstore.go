@@ -181,7 +181,7 @@ func (s *blobStore) publish(ctx context.Context, key cacheKey, stage string, siz
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.Mkdir(filepath.Dir(path), 0700); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.Mkdir(filepath.Dir(path), 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("create blob scope directory: %w", err)
 	}
 	if err := os.Rename(stage, path); err != nil {
