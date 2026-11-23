@@ -2,6 +2,8 @@
 
 这是一个部署在可信内网的通用 Registry Mirror。客户端到 Mirror 的下游认证和仓库授权由后端负责；Mirror 到上游 Registry 的回源认证默认匿名，可单独配置拉取凭据。
 
+需要调整缓存、回源限速或凭据轮换？见 [中文 CLI 参数参考](docs/cli.md)。
+
 ## 后端与信任边界
 
 同一个引用（例如 `mirror-poc.test:15443/registry.k8s.io/pause:3.10`）可以先从公网 Pull，再由正常 Push 写入 Zot 并覆盖该 Tag。删除 Zot 的覆盖后，若允许回退，入口重新使用 Mirror 缓存；默认关闭 Manifest TTL 时，返回已固定的公网版本。Mirror 缓存不写入 Zot，也不会让 Push 误以为 Zot 已有某个 Blob。
