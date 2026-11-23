@@ -71,7 +71,7 @@ func openCacheStorage(ctx context.Context, dir string, limits cacheLimits) (_ *c
 		return nil, err
 	}
 	store.db.SetMaxOpenConns(1)
-	store.manifests, err = newManifestStore(ctx, store.db, limits.manifestBytes, limits.manifestEntries)
+	store.manifests, err = newManifestStore(ctx, store.db, filepath.Join(root, "manifest-freshness"), limits)
 	if err != nil {
 		return nil, fmt.Errorf("open Manifest catalog: %w", err)
 	}

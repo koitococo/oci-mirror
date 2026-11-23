@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"sync"
+	"time"
 )
 
 var (
@@ -28,12 +29,14 @@ type cacheLimits struct {
 	manifestEntries, blobEntries       int
 	stagingBytes, upstreamStagingBytes int64
 	fetches, upstreamFetches           int
+	manifestTTL                        time.Duration
 }
 
 func cacheLimitFlags() *cacheLimits {
 	l := new(cacheLimits)
 	flag.Int64Var(&l.manifestBytes, "cache-manifest-bytes", 64<<20, "total pinned Manifest payload bytes")
 	flag.IntVar(&l.manifestEntries, "cache-manifest-entries", 10000, "total Manifest digest records and Tag bindings")
+	flag.DurationVar(&l.manifestTTL, "cache-manifest-ttl", 0, "maximum Manifest freshness before fetching upstream again (0 disables expiration)")
 	flag.Int64Var(&l.blobBytes, "cache-blob-bytes", 16<<30, "total published Blob payload bytes")
 	flag.IntVar(&l.blobEntries, "cache-blob-entries", 10000, "total published Blob records")
 	flag.Int64Var(&l.stagingBytes, "cache-staging-bytes", 8<<30, "global simultaneous Blob staging bytes")
@@ -47,6 +50,9 @@ func (l cacheLimits) validate() error {
 	if l.manifestBytes <= 0 || l.blobBytes <= 0 || l.manifestEntries <= 0 || l.blobEntries <= 0 ||
 		l.stagingBytes <= 0 || l.upstreamStagingBytes <= 0 || l.fetches <= 0 || l.upstreamFetches <= 0 {
 		return errors.New("cache quota limits must be positive")
+	}
+	if l.manifestTTL < 0 {
+		return errors.New("cache-manifest-ttl must not be negative")
 	}
 	return nil
 }

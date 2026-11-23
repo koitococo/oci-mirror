@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/distribution/reference v0.6.0
 	github.com/google/go-containerregistry v0.22.1
+	golang.org/x/sys v0.47.0
 	golang.org/x/time v0.14.0
 	modernc.org/sqlite v1.54.0
 )
@@ -19,7 +20,6 @@ require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 	modernc.org/libc v1.74.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

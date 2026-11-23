@@ -2,9 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type blobDescriptor struct {
@@ -16,9 +23,19 @@ type manifestStore struct {
 	db         *sql.DB
 	maxBytes   int64
 	maxEntries int
+	ttl        time.Duration
+	freshDir   string
+	// Keep catalog lookups and freshness checks consistent with publication,
+	// which commits to SQLite before updating the filesystem markers.
+	freshMu sync.RWMutex
 }
 
-func newManifestStore(ctx context.Context, db *sql.DB, maxBytes int64, maxEntries int) (*manifestStore, error) {
+func newManifestStore(ctx context.Context, db *sql.DB, freshDir string, limits cacheLimits) (*manifestStore, error) {
+	if limits.manifestTTL > 0 {
+		if err := os.MkdirAll(freshDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create Manifest freshness directory: %w", err)
+		}
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin manifest schema setup: %w", err)
@@ -59,7 +76,10 @@ CREATE INDEX IF NOT EXISTS manifest_blob_lookup
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit manifest schema: %w", err)
 	}
-	return &manifestStore{db: db, maxBytes: maxBytes, maxEntries: maxEntries}, nil
+	return &manifestStore{
+		db: db, maxBytes: limits.manifestBytes, maxEntries: limits.manifestEntries,
+		ttl: limits.manifestTTL, freshDir: freshDir,
+	}, nil
 }
 
 type manifestQuerier interface {
@@ -86,52 +106,108 @@ WHERE t.downstream = ? AND t.source = ? AND t.tag = ?`
 }
 
 func (s *manifestStore) get(ctx context.Context, key cacheKey) (*manifest, error) {
+	if s.ttl > 0 {
+		s.freshMu.RLock()
+		defer s.freshMu.RUnlock()
+		if fresh, err := s.fresh(key); !fresh || err != nil {
+			return nil, err
+		}
+	}
 	return lookupManifest(ctx, s.db, key)
 }
 
+func (s *manifestStore) freshnessPath(key cacheKey) string {
+	sum := sha256.Sum256([]byte(key.downstream + "\x00" + key.source + "\x00" + key.reference))
+	return filepath.Join(s.freshDir, fmt.Sprintf("%x", sum))
+}
+
+func (s *manifestStore) fresh(key cacheKey) (bool, error) {
+	var stat unix.Stat_t
+	if err := unix.Stat(s.freshnessPath(key), &stat); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat Manifest freshness: %w", err)
+	}
+	return time.Since(time.Unix(stat.Ctim.Unix())) < s.ttl, nil
+}
+
+func (s *manifestStore) markFresh(key cacheKey) error {
+	// Creation or truncation advances ctime, including a refresh of the
+	// same digest. Cache hits only stat the marker and never advance it.
+	if err := os.WriteFile(s.freshnessPath(key), nil, 0o600); err != nil {
+		return fmt.Errorf("write Manifest freshness: %w", err)
+	}
+	return nil
+}
+
 func (s *manifestStore) publish(ctx context.Context, key cacheKey, m *manifest, refs []blobDescriptor) (*manifest, error) {
+	if s.ttl > 0 {
+		s.freshMu.Lock()
+		defer s.freshMu.Unlock()
+	}
 	// The store's single SQL connection serializes the lookup, quota check, and insert.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin manifest publication: %w", err)
 	}
 	defer tx.Rollback()
-	if pinned, err := lookupManifest(ctx, tx, key); pinned != nil || err != nil {
-		return pinned, err
-	}
-
-	isTag := !digestPattern.MatchString(key.reference)
-	var existing *manifest
-	if isTag {
-		existing, err = lookupManifest(ctx, tx, cacheKey{cacheScope: key.cacheScope, reference: m.digest})
+	fresh := true
+	if s.ttl > 0 {
+		fresh, err = s.fresh(key)
 		if err != nil {
 			return nil, err
 		}
 	}
+	if fresh {
+		if pinned, err := lookupManifest(ctx, tx, key); pinned != nil || err != nil {
+			return pinned, err
+		}
+	}
+
+	digestKey := cacheKey{cacheScope: key.cacheScope, reference: m.digest}
+	var storedType string
+	err = tx.QueryRowContext(ctx, `SELECT media_type FROM manifests
+WHERE downstream = ? AND source = ? AND digest = ?`, key.downstream, key.source, m.digest).Scan(&storedType)
+	newDigest := errors.Is(err, sql.ErrNoRows)
+	if err != nil && !newDigest {
+		return nil, fmt.Errorf("read cached Manifest media type: %w", err)
+	}
+
+	isTag := !digestPattern.MatchString(key.reference)
 	var extraBytes int64
 	var extraEntries int
-	if existing == nil {
+	if newDigest {
 		extraBytes = int64(len(m.body))
 		extraEntries++
 	}
 	if isTag {
-		extraEntries++
+		var exists bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM manifest_tags
+WHERE downstream = ? AND source = ? AND tag = ?)`, key.downstream, key.source, key.reference).Scan(&exists); err != nil {
+			return nil, fmt.Errorf("read cached Manifest Tag binding: %w", err)
+		}
+		if !exists {
+			extraEntries++
+		}
 	}
-	var usedBytes int64
-	var usedEntries int
-	if err := tx.QueryRowContext(ctx, `
+	if extraEntries > 0 {
+		var usedBytes int64
+		var usedEntries int
+		if err := tx.QueryRowContext(ctx, `
 SELECT COALESCE(SUM(length(body)), 0), COUNT(*) + (SELECT COUNT(*) FROM manifest_tags)
 FROM manifests`).Scan(&usedBytes, &usedEntries); err != nil {
-		return nil, fmt.Errorf("read manifest cache usage: %w", err)
-	}
-	if extraBytes > 0 && extraBytes > s.maxBytes-usedBytes {
-		return nil, quotaLimit(errCacheFull, "cache-manifest-bytes")
-	}
-	if extraEntries > s.maxEntries-usedEntries {
-		return nil, quotaLimit(errCacheFull, "cache-manifest-entries")
+			return nil, fmt.Errorf("read manifest cache usage: %w", err)
+		}
+		if extraBytes > 0 && extraBytes > s.maxBytes-usedBytes {
+			return nil, quotaLimit(errCacheFull, "cache-manifest-bytes")
+		}
+		if extraEntries > s.maxEntries-usedEntries {
+			return nil, quotaLimit(errCacheFull, "cache-manifest-entries")
+		}
 	}
 
-	if existing == nil {
+	if newDigest {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO manifests (downstream, source, digest, media_type, body)
 VALUES (?, ?, ?, ?, ?)`, key.downstream, key.source, m.digest, m.mediaType, m.body); err != nil {
 			return nil, fmt.Errorf("insert cached manifest: %w", err)
@@ -145,16 +221,27 @@ ON CONFLICT (downstream, source, manifest_digest, blob_digest) DO NOTHING`,
 			}
 		}
 	} else {
-		m = existing
+		m.mediaType = storedType
 	}
 	if isTag {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO manifest_tags (downstream, source, tag, digest)
-VALUES (?, ?, ?, ?)`, key.downstream, key.source, key.reference, m.digest); err != nil {
+VALUES (?, ?, ?, ?)
+ON CONFLICT (downstream, source, tag) DO UPDATE SET digest = excluded.digest`, key.downstream, key.source, key.reference, m.digest); err != nil {
 			return nil, fmt.Errorf("bind cached manifest tag: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit manifest publication: %w", err)
+	}
+	if s.ttl > 0 {
+		if err := s.markFresh(digestKey); err != nil {
+			return nil, err
+		}
+		if isTag {
+			if err := s.markFresh(key); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return m, nil
 }

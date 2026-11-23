@@ -33,35 +33,36 @@ Zot 的 HTTP Basic 可由 `http.auth.htpasswd.path` 与可选的 `http.accessCon
 | 规格 | PoC 的行为 |
 | --- | --- |
 | [0002](../.omp/specs/0002-mirror-zot-overlay.md) §2：本地优先 | Manifest `GET`/`HEAD` 与 Blob `GET`（含 `Range`）先用原方法访问后端；只有符合策略的可信本地缺失才回退。缓存不能跳过后端。Blob `HEAD`、上传、会话、mount、PUT、DELETE 和发现接口仍走后端。 |
-| 0002 §3：同名覆盖 | 新 Push 提交后，下一次 Tag 读取优先返回后端版本；按公网旧 digest 读取不转成 Tag 查找。删除本地 Tag 后可再次露出 Mirror 固定版本，不建立屏蔽记录。 |
+| 0002 §3：同名覆盖 | 新 Push 提交后，下一次 Tag 读取优先返回后端版本；按公网旧 digest 读取不转成 Tag 查找。删除本地 Tag 后恢复 Mirror 正常回退，不建立屏蔽记录。 |
 | 0002 §1、§4、[0001](../.omp/specs/0001-lazy-mirror.md) §3、§6：回源 | 用 [Distribution reference](https://pkg.go.dev/github.com/distribution/reference#ParseNormalizedNamed) 规范化上游。Docker Hub 短名自动映射，官方镜像补 `library/`，并访问 `registry-1.docker.io`。逻辑 Registry 的 deny 优先于 allow；这些规则不代替 realm/CDN 的 TLS 与拨号地址校验。Mirror 用 go-containerregistry 完成上游认证，不用客户端入站凭据回源。 |
-| 0001 §4：Manifest | 按请求独立获取原始 Manifest，不拉取 config、层或 Index 的子 Manifest。支持 OCI Image Manifest / Image Index 与 Docker schema 2 Manifest / Manifest List。Tag 和 digest 绑定持久化；已固定的 Tag 不随公网更新而刷新。 |
+| 0001 §2.1、§4：Manifest | 按请求独立获取原始 Manifest，不拉取 config、层或 Index 的子 Manifest。支持 OCI Image Manifest / Image Index 与 Docker schema 2 Manifest / Manifest List。Tag 和 digest 绑定持久化；默认关闭 TTL，已缓存的 Tag 不随公网更新而刷新。 |
 | 0002 §5、0001 §2.2：Blob | 一次冷读只下载目标 digest，并发读者共用同一个生产者。可信长度的完整冷 GET 可以读取正在写入的暂存前缀；末尾至少一字节在验证和发布后发送。冷 Range 等整块校验发布后才从正式缓存返回 `206` 或 `416`。 |
 
-冷获取的 Manifest 上限为 4 MiB、30 秒，Blob 上限为 2 GiB、10 分钟。固定 Tag 不等于所有依赖都已离线可读。
+冷获取和过期刷新的 Manifest 上限均为 4 MiB、30 秒，Blob 上限为 2 GiB、10 分钟。缓存了 Manifest 不等于所有依赖都已离线可读。
 
 规范化不改变后端仓库、鉴权 scope 或覆盖 Tag。缓存同时按下游原仓库名和规范化上游来源隔离；`alpine`、`library/alpine`、`docker.io/library/alpine` 即使同指一个上游，也各自持有缓存。Tag 省略时由 OCI 客户端请求 `latest`；协议层仍要求有效 Tag 或 SHA-256 digest。
 
-改动入口：[`main.go`](../cmd/oci-mirror/main.go) 处理后端转发和回退；[`resolver.go`](../cmd/oci-mirror/resolver.go) 负责引用规范化和回退策略；[`upstream.go`](../cmd/oci-mirror/upstream.go) 负责上游请求与出站策略，[`upstreampool.go`](../cmd/oci-mirror/upstreampool.go) 管理鉴权上下文和匿名回退；[`cache.go`](../cmd/oci-mirror/cache.go) 负责 Manifest 固定、Blob 下载和校验发布；[`blobstream.go`](../cmd/oci-mirror/blobstream.go) 负责并发读者的暂存出流和响应中止。
+改动入口：[`main.go`](../cmd/oci-mirror/main.go) 处理后端转发和回退；[`resolver.go`](../cmd/oci-mirror/resolver.go) 负责引用规范化和回退策略；[`upstream.go`](../cmd/oci-mirror/upstream.go) 负责上游请求与出站策略，[`upstreampool.go`](../cmd/oci-mirror/upstreampool.go) 管理鉴权上下文和匿名回退；[`cache.go`](../cmd/oci-mirror/cache.go) 负责 Manifest 缓存、Blob 下载和校验发布；[`blobstream.go`](../cmd/oci-mirror/blobstream.go) 负责并发读者的暂存出流和响应中止。
 
 ### 持久缓存与配额
 
 `-cache-dir` 必填。每个 Mirror 进程使用一个专用的本地持久目录，不与其他进程共享。`<cache-dir>/mirror-v1/catalog.sqlite` 使用 SQLite WAL 与 `synchronous=FULL`，记录不可变的原始 Manifest 字节、上游来源与下游仓库、Tag 和 digest 绑定、Blob 描述符长度及已发布的 Blob 记录。`mirror-v1/staging/` 存放下载中的临时文件，`mirror-v1/blobs/` 存放已校验发布的 Blob。
 
-重启恢复固定记录与已发布的 Blob，清理中断的暂存文件及孤立文件，并按调低后的 Blob 配额淘汰载荷，不修剪 Manifest 固定记录。已初始化的缓存丢失目录数据库时启动失败，不会静默创建新库并重新固定 Tag。旧布局在 `mirror-v1/` 旁的缓存文件不会被读取、迁移或删除。
+重启恢复 Manifest 绑定、可用的新鲜度标记与已发布的 Blob，清理中断的暂存文件及孤立 Blob 文件，并按调低后的 Blob 配额淘汰载荷，不修剪 Manifest 记录。已初始化的缓存丢失目录数据库时启动失败，不会静默创建新库。旧布局在 `mirror-v1/` 旁的缓存文件不会被读取、迁移或删除。
 
-以下参数均须为正数；字节参数传十进制整数：
+除 TTL 外，下列参数均须为正数；字节参数传十进制整数：
 
 | 参数 | 默认 | 计量对象 |
 | --- | ---: | --- |
-| `-cache-manifest-bytes` | 64 MiB | 固定的原始 Manifest 字节 |
+| `-cache-manifest-ttl` | `0` | Manifest 缓存有效期（Go duration，如 `30m`）；`0` 关闭，负值报错 |
+| `-cache-manifest-bytes` | 64 MiB | 保留的原始 Manifest 字节 |
 | `-cache-manifest-entries` | 10000 | digest 记录与 Tag 绑定合计 |
 | `-cache-blob-bytes` | 16 GiB | 已发布的 Blob 载荷 |
 | `-cache-blob-entries` | 10000 | 已发布的 Blob 记录 |
 | `-cache-staging-bytes` | 8 GiB | 全局 Blob 暂存预留 |
 | `-cache-upstream-staging-bytes` | 4 GiB | 每个逻辑 Registry 的 Blob 暂存预留 |
-| `-cache-fetches` | 4 | 全局并行冷回源请求 |
-| `-cache-upstream-fetches` | 2 | 每个逻辑 Registry 的并行冷回源请求 |
+| `-cache-fetches` | 4 | 全局并行回源请求（含 Manifest 刷新） |
+| `-cache-upstream-fetches` | 2 | 每个逻辑 Registry 的并行回源请求（含 Manifest 刷新） |
 
 例如，以下参数可用于指定缓存目录并限制 Blob 容量，前提是专用目录已由运维人员准备且运行用户可写：
 
@@ -69,13 +70,23 @@ Zot 的 HTTP Basic 可由 `http.auth.htpasswd.path` 与可选的 `http.accessCon
 -cache-dir /var/lib/oci-mirror/cache -cache-blob-bytes 8589934592 -cache-blob-entries 5000
 ```
 
-并发槽由冷 Manifest 和冷 Blob 请求共用；每上游配额按逻辑 Registry 计量，Docker Hub 别名共用配额，但不同 Registry 的小请求可在全局额度内并发。Blob 写入暂存前按已知预期长度预留空间，长度未知时按有上限的单对象额度预留。已知长度超出配额或剩余配额不足返回 `507`，冷回源槽用尽返回 `503`，目录中已有发布记录但文件缺失或长度不符返回 `500`。
+并发槽由需要回源的 Manifest（包括刷新）和冷 Blob 请求共用；每上游配额按逻辑 Registry 计量，Docker Hub 别名共用配额，但不同 Registry 的小请求可在全局额度内并发。Blob 写入暂存前按已知预期长度预留空间，长度未知时按有上限的单对象额度预留。已知长度超出配额或剩余配额不足返回 `507`，回源槽用尽返回 `503`，目录中已有 Blob 发布记录但文件缺失或长度不符返回 `500`。
 
-Manifest 固定记录不淘汰；额度不足时新增绑定返回 `507`。Blob 淘汰采用近似 LRU，跳过正在读取的载荷，最近访问时间按一秒粒度更新。已发布载荷预算不含 SQLite 元数据及 WAL 开销，也不含暂存和旧布局文件；这些参数不是物理磁盘用量的硬上限。需要硬上限时另设文件系统配额，并为目录数据库与 WAL 留出空间。
+Manifest 记录不淘汰；Tag 刷新不会删除旧 digest，旧记录仍计入配额，额度不足时新增 digest 或绑定返回 `507`。Blob 淘汰采用近似 LRU，跳过正在读取的载荷，最近访问时间按一秒粒度更新。已发布载荷预算不含 SQLite 元数据、WAL、新鲜度标记、暂存和旧布局文件；这些参数不是物理磁盘用量的硬上限。需要硬上限时另设文件系统配额，并为这些额外开销留出空间。
+
+#### Manifest TTL
+
+启用时，`<cache-dir>/mirror-v1/manifest-freshness/` 保存新鲜度标记，按原下游仓库、规范化上游来源及 Tag 或 digest 引用隔离。Mirror 读取文件系统 `stat` 的 `ctime`（inode 变更时间）作为最近成功回源时间；命中不续期，重启不重置期限。已有缓存记录若无标记，启用 TTL 后首次访问即回源。
+
+Manifest `GET` 和 `HEAD` 都先查 Zot。仅在确认 Zot 缺失且允许回退后，Mirror 才检查该引用的新鲜度；过期请求走现有回源流程，失败不返回旧 Manifest。按 Tag 成功回源会更新 Tag 指向，并刷新该 Tag 和返回 digest 的标记；按 digest 成功回源只刷新该 digest，不续期任何 Tag。关闭 TTL 后忽略新鲜度，固定当前已保存的 Tag 绑定；不改变 Blob 策略。
+
+可用短 TTL 和受控上游验收：缓存 Tag → A 后让上游改为 B；期限内应仍返回 A，命中不延长有效期；过期后，若回源成功应返回 B，若回源失败则不应返回 A。另按 digest 验证过期会回源、刷新 digest 不续期 Tag，以及旧 digest 保留并占用配额、加入新 digest 超限返回 `507`。Zot 同名 Tag 存在时应始终优先。
+
+保持 TTL 为 `0` 可复用本文的同名覆盖 smoke 流程；其删除覆盖后的字节比较要求返回原来缓存的公网 Tag。
 
 ### 持久缓存历史实测
 
-在保留的 Zot 和 docker-auth 上，用专用缓存目录触发 `SIGKILL` 后重启，并移除 `r.ltkk.run` 的私网出站例外。相同 Tag、digest、原始 Manifest 字节和 Blob 仍命中，新的冷 Tag 因无法回源返回 `502`。SQLite 中保有原 Manifest 的 Blob 描述符；中断 staging 与无目录记录的 Blob 文件被清理，旧布局文件未触碰。第二个 Mirror 不能同时打开该目录。
+以下是默认关闭 TTL 时的历史结果。在保留的 Zot 和 docker-auth 上，用专用缓存目录触发 `SIGKILL` 后重启，并移除 `r.ltkk.run` 的私网出站例外。相同 Tag、digest、原始 Manifest 字节和 Blob 仍命中，新的冷 Tag 因无法回源返回 `502`。SQLite 中保有原 Manifest 的 Blob 描述符；中断 staging 与无目录记录的 Blob 文件被清理，旧布局文件未触碰。第二个 Mirror 不能同时打开该目录。
 
 缩小配额后，实测 Blob 按字节及条目上限分别淘汰，Manifest 固定记录不受影响；超出 Manifest 或 staging 配额返回 `507`。原已发布 Blob 被截断后返回 `500` 而不重新回源，另一个上游仓库不存在同一 digest 时仍返回 `404`。独立的压力场景也验证了全局/每上游的并发与暂存限制、活动读者不被回收、并发发布只保留同一份 Tag 绑定。
 

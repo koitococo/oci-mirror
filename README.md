@@ -4,7 +4,7 @@
 
 ## 后端与信任边界
 
-同一个引用（例如 `mirror-poc.test:15443/registry.k8s.io/pause:3.10`）可以先从公网 Pull，再由正常 Push 写入 Zot 并覆盖该 Tag。删除 Zot 的覆盖后，入口重新返回 Mirror 固定的公网版本。Mirror 缓存不写入 Zot，也不会让 Push 误以为 Zot 已有某个 Blob。
+同一个引用（例如 `mirror-poc.test:15443/registry.k8s.io/pause:3.10`）可以先从公网 Pull，再由正常 Push 写入 Zot 并覆盖该 Tag。删除 Zot 的覆盖后，若允许回退，入口重新使用 Mirror 缓存；默认关闭 Manifest TTL 时，返回已固定的公网版本。Mirror 缓存不写入 Zot，也不会让 Push 误以为 Zot 已有某个 Blob。
 
 `-backend` 指定受操作者信任的私有 HTTP/HTTPS Registry origin（可使用 IP 或 DNS 名称；在可信容器网络以外应使用 HTTPS），`-cache-dir` 必填。`-listen` 接受 IP 字面量和端口，默认 `127.0.0.1:15000`；在独立的 Docker 网络中可显式绑定 `0.0.0.0:15000`，由 ingress 访问而不发布宿主机端口。后端可使用符合下述契约的 Zot 或 Distribution。客户端连接受信任的 HTTPS 入口；Mirror 原样转发正常的 `/v2/` 探测与具体资源请求的 `Authorization`，并透传后端认证挑战。Mirror 不验证下游凭据、不读取后端 JWT 证书或 issuer，也不会把 `/v2/` 成功当作具体仓库的拉取授权。客户端的 `Authorization` 不会转发给上游。
 
@@ -200,7 +200,7 @@ services:
 
 ## 持久缓存
 
-将必填的 `-cache-dir` 指向本机专用持久目录，只交给一个 Mirror 进程使用。重启会恢复固定的 Manifest 和 Tag；Blob 可按容量淘汰，固定 Tag 不保证依赖全部可离线读取。新布局不读取、不迁移也不删除旧缓存文件。[目录布局、配额参数和运维限制](docs/poc.md#持久缓存与配额)。
+将必填的 `-cache-dir` 指向本机专用持久目录，只交给一个 Mirror 进程使用。重启会恢复 Manifest 和 Tag 绑定。`-cache-manifest-ttl` 接受 Go duration（如 `30m`），默认 `0`，不刷新已缓存的 Tag；启用后，Zot 可信缺失且允许回退时，过期的 Tag 或 digest 请求必须重新回源，失败不返回旧清单。Blob 仍可按容量淘汰，缓存了 Manifest 不保证依赖全部可离线读取。新布局不读取、不迁移也不删除旧缓存文件。[目录布局、配额参数和运维限制](docs/poc.md#持久缓存与配额)。
 
 长度可信的完整冷 Blob GET 可以提前收到前缀；末尾至少一字节只会在校验和正式发布成功后发送。Range 和条件请求仍等正式缓存。前置代理须关闭 Registry 响应缓冲，或尊重 Mirror 的 `X-Accel-Buffering: no`；上面的 Nginx 示例已关闭 `/v2/` 的缓冲。
 
