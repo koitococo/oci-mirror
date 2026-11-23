@@ -177,26 +177,35 @@ kill -0 "$mirror_pid"
 
 ```bash
 umask 077
-export UPSTREAM_AUTHFILE="$(mktemp -d)/auth.json"
-skopeo login --authfile "$UPSTREAM_AUTHFILE" docker.io
+export UPSTREAM_AUTH_DIR="$(mktemp -d)"
+skopeo login --authfile "$UPSTREAM_AUTH_DIR/auth.json" docker.io
 ```
 
-将以下两项分别追加到现有 `services.mirror.command` 和 `services.mirror.volumes`（保留原条目）：
+将以下命令参数和挂载分别追加到现有 `services.mirror.command` 和 `services.mirror.volumes`（保留原条目）。在 Linux 上需要自动重载时，取消示例中监听开关的注释：
 
 ```yaml
 services:
   mirror:
     command:
-      - -upstream-authfile=/run/secrets/upstream-auth.json
+      - -upstream-authfile=/run/upstream-auth/auth.json
+      # - -upstream-authfile-watch=true
     volumes:
-      - ${UPSTREAM_AUTHFILE}:/run/secrets/upstream-auth.json:ro
+      - ${UPSTREAM_AUTH_DIR}:/run/upstream-auth:ro
 ```
 
-保持文件权限最小化，确保容器运行用户（默认 UID/GID `65532:65532`，按宿主机的用户映射换算）可读；不要把文件提交到仓库。Mirror 仅在启动时读取显式指定的文件，凭据轮换后需重启。也可使用 [Docker CLI 登录](https://docs.docker.com/reference/cli/docker/login/) 生成的 `config.json`，但凭据须内嵌在 `auths` 中（Base64 不是加密）；如果凭据由 Docker Desktop、`credsStore` 或 `credHelpers` 保存，请用上面的 Skopeo 命令生成独立文件。Mirror 不执行 helper、不搜索默认配置、不执行登录。凭据匹配支持 Docker Hub 别名；更具体的仓库路径优先于上级路径或 Registry 条目。
+只读挂载专用父目录，不要单独挂载文件：原子替换会更换文件的 inode，单文件 bind mount 仍会指向旧文件。保持权限最小化，确保容器运行用户（默认 UID/GID `65532:65532`，按宿主机的用户映射换算）可遍历目录并读取文件；每次轮换也要保留所需权限。不要把凭据提交到仓库。也可使用 [Docker CLI 登录](https://docs.docker.com/reference/cli/docker/login/) 生成的 `config.json`，但凭据须内嵌在 `auths` 中（Base64 不是加密）；如果凭据由 Docker Desktop、`credsStore` 或 `credHelpers` 保存，请用上面的 Skopeo 命令生成独立文件。Mirror 不执行 helper、不搜索默认配置、不执行登录；解析时跳过无效条目。凭据匹配支持 Docker Hub 别名；更具体的仓库路径优先于上级路径或 Registry 条目。
 
-认证握手默认只信任 Registry 自身（Docker Hub 也信任 `auth.docker.io`）。确需独立令牌服务时，可用 `-upstream-auth-realm=registry.example.com=auth.example.com` 为该 Registry 增加一个精确主机名；仍适用 HTTPS/443、出站策略和 `-deny-registry`。凭据文件或条目不可用、上游拒绝凭据（按需先刷新 token），或握手目的地不受信任时，Mirror 告警并尝试匿名回源。匿名成功则正常返回，并按池内 pull scope 复用该选择，直至淘汰或重启；匿名失败仍按原有状态处理。
+轮换时，推荐先在同一目录完整写好新文件，再原子替换 `-upstream-authfile` 指向的文件，保持配置路径不变。默认不自动重载：对直接运行的 Mirror 执行 `kill -HUP <pid>`，或对 Compose 服务执行 `docker compose kill -s HUP mirror`。
 
-上游账号由 Mirror 共享，不是客户端身份。仅在后端对原仓库名执行读取 ACL 并返回可信缺失后，才会查 Mirror 缓存或回源。已缓存的私有内容仍受该 ACL 控制；移除凭据文件不撤销客户端权限，也不会清除持久缓存。开放匿名读取的后端不应配置可读私有内容的上游账号。
+`-upstream-authfile-watch` 默认关闭，启用时必须同时配置 `-upstream-authfile`。该开关仅支持 Linux；在非 Linux 上启用或无法建立监听时，Mirror 会启动失败。监听不轮询，只关注父目录中目标文件的同目录原子替换和关闭写入事件，启用后无需发送信号，仍可随时手动发送 `SIGHUP`。Compose 仍须挂载父目录；请勿替换或移动父目录本身，否则监听失效并记录告警，此时仍可手动发送 `SIGHUP`。
+
+重载成功时记录 `upstream_authfile_reloaded`；之后开始的回源会用新凭据重新协商认证，已在途的回源可继续使用旧会话。Registry 限速状态和磁盘缓存都保留。
+
+如果文件无法读取或顶层解析失败，Mirror 会保留最后一次有效的凭据快照，并记录不含文件路径或内容的 WARN。要清空凭据，请用有效的 `{"auths":{}}` 替换文件，再按上述方式重载；不要直接删除文件。
+
+认证握手默认只信任 Registry 自身（Docker Hub 也信任 `auth.docker.io`）。确需独立令牌服务时，可用 `-upstream-auth-realm=registry.example.com=auth.example.com` 为该 Registry 增加一个精确主机名；仍适用 HTTPS/443、出站策略和 `-deny-registry`。启动时凭据文件不可用、回源所用的凭据条目不可用、上游拒绝凭据（按需先刷新 token），或握手目的地不受信任时，Mirror 告警并尝试匿名回源。匿名成功则正常返回，并按池内 pull scope 复用该选择，直至该上下文被淘汰、凭据成功重载或进程重启；匿名失败仍按原有状态处理。
+
+上游账号由 Mirror 共享，不是客户端身份。仅在后端对原仓库名执行读取 ACL 并返回可信缺失后，才会查 Mirror 缓存或回源。已缓存的私有内容仍受该 ACL 控制；清空上游凭据不撤销客户端权限，也不会清除持久缓存。开放匿名读取的后端不应配置可读私有内容的上游账号。
 
 ## 持久缓存
 

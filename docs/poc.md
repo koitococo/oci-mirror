@@ -23,6 +23,10 @@ Zot 的 HTTP Basic 可由 `http.auth.htpasswd.path` 与可选的 `http.accessCon
 
 上游 Registry 请求复用同一 HTTP Transport 和连接池。鉴权上下文以 Registry API 主机与规范化仓库的 `pull` scope 为键，不跨仓库共享 token；下游身份、缓存归属和后端路由继续使用原始仓库名。一个上游 Registry 的令牌桶计量注册表探测、令牌请求及重定向后的 CDN 请求；缓存命中不消耗出站额度。
 
+上游凭据轮换推荐按 [README 的轮换步骤](../README.md#可选上游认证)在同一目录原子替换文件。默认用 `SIGHUP` 手动重载；Linux 上同时配置 `-upstream-authfile` 和 `-upstream-authfile-watch=true` 时，Mirror 监听父目录中目标文件的原子替换和关闭写入事件，无需发信号，也不轮询。启动时无法建立监听或在非 Linux 上启用都会报错退出。Compose 应挂载父目录而不是单个文件；不要替换或移动父目录本身，否则监听失效并告警。无论是否启用监听，手动 `SIGHUP` 始终可用。
+
+重载成功后，后续回源重新协商认证，在途请求可继续使用旧会话，Registry 令牌桶与持久缓存不重置；读取或顶层解析失败时继续使用最后一次有效的凭据快照。清空凭据须重载有效的 `{"auths":{}}`，不要删除文件。
+
 | 参数 | 默认 | 含义 |
 | --- | --- | --- |
 | `-upstream-registries` | 128 | 进程内最多跟踪的上游 Registry 数 |

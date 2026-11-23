@@ -83,6 +83,25 @@ func loadUpstreamAuthFile(path string) upstreamAuthFile {
 	return entries
 }
 
+func (p *upstreamPool) reloadAuthFile(path string) {
+	file := loadUpstreamAuthFile(path)
+	if file == nil {
+		// A read or parse failure leaves the last valid snapshot in use.
+		return
+	}
+	p.mu.Lock()
+	p.auth.file = file
+	// Existing leases can finish on their old scope. Drop cached
+	// credentials and tokens for new leases without resetting rate limits.
+	for _, entry := range p.registries {
+		r := entry.Value.(*upstreamRegistry)
+		clear(r.scopes)
+		r.lru.Init()
+	}
+	p.mu.Unlock()
+	slog.Info("upstream_authfile_reloaded")
+}
+
 func parseUpstreamAuthScope(key string) (upstreamAuthScope, int, bool) {
 	scheme, address, urlKey := strings.Cut(key, "://")
 	if urlKey {

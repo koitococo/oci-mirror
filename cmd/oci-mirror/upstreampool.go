@@ -247,8 +247,11 @@ func (p *upstreamPool) handshake(reg name.Registry, r *upstreamRegistry, s *upst
 	if handshake.err == nil {
 		s.auth = handshake
 	} else if s.auth == nil {
-		r.lru.Remove(r.scopes[s.scope])
-		delete(r.scopes, s.scope)
+		// A pre-reload handshake must not remove a replacement scope.
+		if e := r.scopes[s.scope]; e != nil && e.Value == s {
+			r.lru.Remove(e)
+			delete(r.scopes, s.scope)
+		}
 	}
 	close(handshake.ready)
 }

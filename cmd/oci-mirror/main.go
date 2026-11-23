@@ -137,7 +137,8 @@ func run() error {
 	cacheDir := flag.String("cache-dir", "", "directory for the persistent Mirror cache (required)")
 	limits := cacheLimitFlags()
 	upstreamLimit := upstreamLimitFlags()
-	authfile := flag.String("upstream-authfile", "", "read-only Docker/Skopeo auth file for upstream pulls (optional)")
+	authfile := flag.String("upstream-authfile", "", "read-only Docker/Skopeo auth file for upstream pulls (optional; reload with SIGHUP)")
+	authfileWatch := flag.Bool("upstream-authfile-watch", false, "automatically reload the upstream auth file on change (Linux inotify)")
 	authRealms := make(map[string]string)
 	flag.Func("upstream-auth-realm", "trust an additional token host for a registry (registry=hostname; repeatable for different registries)", func(value string) error {
 		reg, host, ok := strings.Cut(strings.ToLower(value), "=")
@@ -186,9 +187,24 @@ func run() error {
 	if *cacheDir == "" {
 		return errors.New("-cache-dir is required")
 	}
+	if *authfileWatch && *authfile == "" {
+		return errors.New("-upstream-authfile-watch requires -upstream-authfile")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+	defer signal.Stop(reload)
+	var authfileChanges <-chan struct{}
+	if *authfileWatch {
+		changes, stopWatch, err := watchAuthFile(*authfile)
+		if err != nil {
+			return fmt.Errorf("watch upstream auth file: %w", err)
+		}
+		defer stopWatch()
+		authfileChanges = changes
+	}
 	transport := newBackendTransport()
 	defer transport.CloseIdleConnections()
 	auth := upstreamAuth{file: loadUpstreamAuthFile(*authfile), realms: authRealms}
@@ -206,17 +222,27 @@ func run() error {
 	done := make(chan error, 1)
 	go func() { done <- server.ListenAndServe() }()
 	log.Printf("mirror listen=%s backend=%s", *listen, backend.Host)
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdown); err != nil {
-			_ = server.Close()
+	for {
+		select {
+		case err := <-done:
 			return err
+		case <-ctx.Done():
+			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := server.Shutdown(shutdown); err != nil {
+				_ = server.Close()
+				return err
+			}
+			return nil
+		case <-reload:
+			cache.upstream.reloadAuthFile(*authfile)
+		case _, ok := <-authfileChanges:
+			if !ok {
+				authfileChanges = nil
+				continue
+			}
+			cache.upstream.reloadAuthFile(*authfile)
 		}
-		return nil
 	}
 }
 
